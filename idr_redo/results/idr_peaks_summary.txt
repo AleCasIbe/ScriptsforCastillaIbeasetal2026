@@ -1,0 +1,15 @@
+Number of conservative peaks: 25887
+Number of filtered conservative peaks (GlobalIDR >=1) (Nt): 1486
+Number of optimal peaks for rep1: 64843
+Number of filtered optimal peaks for rep1 (GlobalIDR >=1) (N1): 1192
+Number of intersected filtered optimal peaks for rep1 (GlobalIDR >=1): 0
+Number of optimal peaks for rep2: 60572
+Number of filtered optimal peaks for rep2 (GlobalIDR >=1) (N2): 1126
+Number of intersected filtered optimal peaks for rep2 (GlobalIDR >=1): 0
+Number of optimal peaks for pooled data: 55872
+Number of filtered optimal peaks for pooled data (GlobalIDR >=1) (Np): 2120
+Number of intersected filtered optimal peaks for pooled data (GlobalIDR >=1): 0
+Rescue ratio = max (Np, Nt) / min (Np, Nt) :
+1.42665
+Self consistency ratio = max (N1, N2) / min (N1, N2) = 
+1.05861

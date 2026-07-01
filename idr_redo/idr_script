@@ -1,0 +1,108 @@
+### IDR corre en py3 asi que hay que cambiar de entorno. 
+### Se realiza el analisis de las replicas originales y de cada par de pseudoreplicas.
+### bash idr_juan folder
+
+
+wd=$PWD
+folder=$1
+name_folder=${folder##*/}
+
+#de-activate the virtual env for python 2 which has MACS2
+#conda deactivate
+#activate the virtual env for python 3 which has IDR
+#conda activate IDR_Juan_2
+
+id=$2
+cd ./scratch$id/results/
+
+##added by alex-> prefiltering of blacklisted regions so IDR stats are not inflated by consistent blacklisted peaks
+### bedtools intersect -v -a peaks.narrowPeak -b blacklist.bed > peaks.clean.narrowPeak
+
+echo 'Filtering blacklist regions'
+bedtools intersect -v -a     ./CONS_PEAKS/${name_folder}_rep1_toppeaks.bed -b /home/castillaa/chip/IDR/idr_redo/mm10-blacklist.v2.bed >     ./CONS_PEAKS/${name_folder}_rep1_toppeaks_bl.bed &
+bedtools intersect -v -a     ./CONS_PEAKS/${name_folder}_rep2_toppeaks.bed -b /home/castillaa/chip/IDR/idr_redo/mm10-blacklist.v2.bed >     ./CONS_PEAKS/${name_folder}_rep2_toppeaks_bl.bed &
+bedtools intersect -v -a     ./CONS_PEAKS/${name_folder}_pool_toppeaks.bed -b /home/castillaa/chip/IDR/idr_redo/mm10-blacklist.v2.bed >     ./CONS_PEAKS/${name_folder}_pool_toppeaks_bl.bed &
+bedtools intersect -v -a ./OPT_PEAKS/${name_folder}_rep1_ps00_toppeaks.bed -b /home/castillaa/chip/IDR/idr_redo/mm10-blacklist.v2.bed > ./OPT_PEAKS/${name_folder}_rep1_ps00_toppeaks_bl.bed &
+bedtools intersect -v -a ./OPT_PEAKS/${name_folder}_rep1_ps01_toppeaks.bed -b /home/castillaa/chip/IDR/idr_redo/mm10-blacklist.v2.bed > ./OPT_PEAKS/${name_folder}_rep1_ps01_toppeaks_bl.bed &
+bedtools intersect -v -a     ./CONS_PEAKS/${name_folder}_rep1_toppeaks.bed -b /home/castillaa/chip/IDR/idr_redo/mm10-blacklist.v2.bed >     ./CONS_PEAKS/${name_folder}_rep1_toppeaks_bl.bed &
+bedtools intersect -v -a ./OPT_PEAKS/${name_folder}_rep2_ps00_toppeaks.bed -b /home/castillaa/chip/IDR/idr_redo/mm10-blacklist.v2.bed > ./OPT_PEAKS/${name_folder}_rep2_ps00_toppeaks_bl.bed &
+bedtools intersect -v -a ./OPT_PEAKS/${name_folder}_rep2_ps01_toppeaks.bed -b /home/castillaa/chip/IDR/idr_redo/mm10-blacklist.v2.bed > ./OPT_PEAKS/${name_folder}_rep2_ps01_toppeaks_bl.bed &
+bedtools intersect -v -a     ./CONS_PEAKS/${name_folder}_rep2_toppeaks.bed -b /home/castillaa/chip/IDR/idr_redo/mm10-blacklist.v2.bed >     ./CONS_PEAKS/${name_folder}_rep2_toppeaks_bl.bed &
+bedtools intersect -v -a ./OPT_PEAKS/${name_folder}_pool_ps00_toppeaks.bed -b /home/castillaa/chip/IDR/idr_redo/mm10-blacklist.v2.bed > ./OPT_PEAKS/${name_folder}_pool_ps00_toppeaks_bl.bed &
+bedtools intersect -v -a ./OPT_PEAKS/${name_folder}_pool_ps01_toppeaks.bed -b /home/castillaa/chip/IDR/idr_redo/mm10-blacklist.v2.bed > ./OPT_PEAKS/${name_folder}_pool_ps01_toppeaks_bl.bed &
+bedtools intersect -v -a     ./CONS_PEAKS/${name_folder}_pool_toppeaks.bed -b /home/castillaa/chip/IDR/idr_redo/mm10-blacklist.v2.bed >     ./CONS_PEAKS/${name_folder}_pool_toppeaks_bl.bed & 
+wait %1 %2 %3 %4 %5 %6 %7 %8 %9 %10 %11 %12
+echo 'Done filtering blacklist regions'
+
+
+
+echo 'Starting IDR analysis'
+idr --input-file-type narrowPeak --rank p.value --soft-idr-threshold 0.1 -s ./CONS_PEAKS/${name_folder}_rep1_toppeaks_bl.bed ./CONS_PEAKS/${name_folder}_rep2_toppeaks_bl.bed -p ./CONS_PEAKS/${name_folder}_pool_toppeaks_bl.bed --verbose -l ./CONS_PEAKS/idr_consrv.log -o ./CONS_PEAKS/${name_folder}_rep1_rep2.txt --plot &
+idr --input-file-type narrowPeak --rank p.value --soft-idr-threshold 0.1 -s ./OPT_PEAKS/${name_folder}_rep1_ps00_toppeaks_bl.bed ./OPT_PEAKS/${name_folder}_rep1_ps01_toppeaks_bl.bed -p ./CONS_PEAKS/${name_folder}_rep1_toppeaks_bl.bed --verbose -l ./OPT_PEAKS/idr_opt_rep1.log -o ./OPT_PEAKS/${name_folder}_rep1_ps.txt --plot &
+idr --input-file-type narrowPeak --rank p.value --soft-idr-threshold 0.1 -s ./OPT_PEAKS/${name_folder}_rep2_ps00_toppeaks_bl.bed ./OPT_PEAKS/${name_folder}_rep2_ps01_toppeaks_bl.bed -p ./CONS_PEAKS/${name_folder}_rep2_toppeaks_bl.bed --verbose -l ./OPT_PEAKS/idr_opt_rep2.log -o ./OPT_PEAKS/${name_folder}_rep2_ps.txt --plot &
+idr --input-file-type narrowPeak --rank p.value --soft-idr-threshold 0.1 -s ./OPT_PEAKS/${name_folder}_pool_ps00_toppeaks_bl.bed ./OPT_PEAKS/${name_folder}_pool_ps01_toppeaks_bl.bed -p ./CONS_PEAKS/${name_folder}_pool_toppeaks_bl.bed --verbose -l ./OPT_PEAKS/idr_opt_pool.log -o ./OPT_PEAKS/${name_folder}_pool_ps.txt --plot &
+wait %1 %2 %3 %4
+echo 'Done IDR analysis'
+
+
+
+### Se filtran los picos por un valor de IDR global de 0.01 (columna 12 >= 1 puesto que -log10(0.1)) para las replicas originales.
+### Informacion sobre el output en https://github.com/nboley/idr
+
+awk 'BEGIN{OFS="\t"} $12>='"1"' {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12}' ./CONS_PEAKS/${name_folder}_rep1_rep2.txt | sort -k7n,7n  > ./CONS_PEAKS/${name_folder}_idrConsPeaks.bed &
+awk 'BEGIN{OFS="\t"} $12>='"1"' {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12}' ./OPT_PEAKS/${name_folder}_rep1_ps.txt | bedtools intersect -v -a - -b ./CONS_PEAKS/${name_folder}_idrConsPeaks.bed -f 0.55 | sort -k7n,7n  > ./OPT_PEAKS/${name_folder}_idrOptPeaks_intsrep1.bed &
+awk 'BEGIN{OFS="\t"} $12>='"1"' {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12}' ./OPT_PEAKS/${name_folder}_rep1_ps.txt | sort -k7n,7n  > ./OPT_PEAKS/${name_folder}_idrOptPeaks_rep1.bed &
+awk 'BEGIN{OFS="\t"} $12>='"1"' {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12}' ./OPT_PEAKS/${name_folder}_rep2_ps.txt | bedtools intersect -v -a - -b ./CONS_PEAKS/${name_folder}_idrConsPeaks.bed -f 0.55 | sort -k7n,7n  > ./OPT_PEAKS/${name_folder}_idrOptPeaks_intsrep2.bed &
+awk 'BEGIN{OFS="\t"} $12>='"1"' {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12}' ./OPT_PEAKS/${name_folder}_rep2_ps.txt | sort -k7n,7n  > ./OPT_PEAKS/${name_folder}_idrOptPeaks_rep2.bed &
+awk 'BEGIN{OFS="\t"} $12>='"1"' {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12}' ./OPT_PEAKS/${name_folder}_pool_ps.txt | bedtools intersect -v -a - -b ./CONS_PEAKS/${name_folder}_idrConsPeaks.bed -f 0.55 | sort -k7n,7n  > ./OPT_PEAKS/${name_folder}_idrOptPeaks_intspool.bed &
+awk 'BEGIN{OFS="\t"} $12>='"1"' {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12}' ./OPT_PEAKS/${name_folder}_pool_ps.txt | sort -k7n,7n  > ./OPT_PEAKS/${name_folder}_idrOptPeaks_pool.bed &
+wait %1 %2 %3 %4 %5 %6 %7
+
+### Se obtienen estadisticas sobre numero de picos.
+
+conspeaks=$(wc -l < ./CONS_PEAKS/${name_folder}_rep1_rep2.txt)
+conspeaks_filt=$(wc -l < ./CONS_PEAKS/${name_folder}_idrConsPeaks.bed)
+
+optpeaks1=$(wc -l < ./OPT_PEAKS/${name_folder}_rep1_ps.txt)
+optpeaks1_filt_int=$(wc -l < ./OPT_PEAKS/${name_folder}_idrOptPeaks_intsrep1.bed)
+optpeaks1_filt=$(wc -l < ./OPT_PEAKS/${name_folder}_idrOptPeaks_rep1.bed)
+
+optpeaks2=$(wc -l < ./OPT_PEAKS/${name_folder}_rep2_ps.txt)
+optpeaks2_filt_int=$(wc -l < ./OPT_PEAKS/${name_folder}_idrOptPeaks_intsrep2.bed)
+optpeaks2_filt=$(wc -l < ./OPT_PEAKS/${name_folder}_idrOptPeaks_rep2.bed)
+
+optpeaksp=$(wc -l < ./OPT_PEAKS/${name_folder}_pool_ps.txt)
+optpeaksp_filt_int=$(wc -l < ./OPT_PEAKS/${name_folder}_idrOptPeaks_intspool.bed)
+optpeaksp_filt=$(wc -l < ./OPT_PEAKS/${name_folder}_idrOptPeaks_pool.bed)
+
+
+echo 'Writing statistics'
+echo "Number of conservative peaks: $conspeaks" > idr_peaks_summary.txt
+echo "Number of filtered conservative peaks (GlobalIDR >=1) (Nt): $conspeaks_filt" >> idr_peaks_summary.txt
+echo "Number of optimal peaks for rep1: $optpeaks1" >> idr_peaks_summary.txt
+echo "Number of filtered optimal peaks for rep1 (GlobalIDR >=1) (N1): $optpeaks1_filt" >> idr_peaks_summary.txt
+echo "Number of intersected filtered optimal peaks for rep1 (GlobalIDR >=1): $optpeaks1_filt_int" >> idr_peaks_summary.txt
+echo "Number of optimal peaks for rep2: $optpeaks2" >> idr_peaks_summary.txt
+echo "Number of filtered optimal peaks for rep2 (GlobalIDR >=1) (N2): $optpeaks2_filt" >> idr_peaks_summary.txt
+echo "Number of intersected filtered optimal peaks for rep2 (GlobalIDR >=1): $optpeaks2_filt_int" >> idr_peaks_summary.txt
+echo "Number of optimal peaks for pooled data: $optpeaksp" >> idr_peaks_summary.txt
+echo "Number of filtered optimal peaks for pooled data (GlobalIDR >=1) (Np): $optpeaksp_filt" >> idr_peaks_summary.txt
+echo "Number of intersected filtered optimal peaks for pooled data (GlobalIDR >=1): $optpeaksp_filt_int" >> idr_peaks_summary.txt
+max_rr=$(($optpeaksp_filt > $conspeaks_filt ? $optpeaksp_filt : $conspeaks_filt))
+min_rr=$(($optpeaksp_filt < $conspeaks_filt ? $optpeaksp_filt : $conspeaks_filt))
+echo "Rescue ratio = max (Np, Nt) / min (Np, Nt) :" >> idr_peaks_summary.txt
+awk "BEGIN {print (($max_rr/$min_rr))}" >> idr_peaks_summary.txt
+max_sc=$(($optpeaks1_filt > $optpeaks2_filt ? $optpeaks1_filt : $optpeaks2_filt))
+min_sc=$(($optpeaks1_filt < $optpeaks2_filt ? $optpeaks1_filt : $optpeaks2_filt))
+echo "Self consistency ratio = max (N1, N2) / min (N1, N2) = $sc_ratio" >> idr_peaks_summary.txt
+awk "BEGIN {print (($max_sc/$min_sc))}" >> idr_peaks_summary.txt
+
+mkdir ./TRACKS
+mv ./CONS_PEAKS/${name_folder}_idrConsPeaks.bed ./TRACKS
+mv ./OPT_PEAKS/${name_folder}_idrOptPeaks* ./TRACKS
+
+echo 'DONE'
+
+### Se guardan los datos en las carpetas correspondientes y se elimina la carpeta temporal
+
+
