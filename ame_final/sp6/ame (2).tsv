@@ -1,0 +1,6 @@
+rank	motif_DB	motif_ID	motif_alt_ID	consensus	p-value	adj_p-value	E-value	tests	FASTA_max	pos	neg	PWM_min	TP	%TP	FP	%FP	RE
+1	TAATTAYAGGBTT.meme	TAATTAYAGGBTT	MEME-1	TAATTAYAGGBTT	4.44E-239	3.14E-236	3.14E-236	708	967	967	1934	1.98	552	57.08	70	3.62	15.7679558
+																	
+# AME (Analysis of Motif Enrichment): Version 5.5.9 compiled on Nov 21 2025 at 19:28:00																	
+# The format of this file is described at https://meme-suite.org/meme/doc/ame-output-format.html.																	
+# ame --verbose 1 --oc . --bgfile bck.txt --scoring avg --method fisher --hit-lo-fraction 0.25 --evalue-report-threshold 10.0 --control --shuffle-- --kmer 2 sp6_pool_4cs.bed.fa TAATTAYAGGBTT.meme																	

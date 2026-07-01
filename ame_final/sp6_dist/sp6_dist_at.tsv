@@ -1,0 +1,6 @@
+rank	motif_DB	motif_ID	motif_alt_ID	consensus	p-value	adj_p-value	E-value	tests	FASTA_max	pos	neg	PWM_min	TP	%TP	FP	%FP	RE
+1	BNTAATTAYAGGBTK.meme	BNTAATTAYAGGBTK	MEME-1	BNTAATTAYAGGBTK	6.77E-215	4.63E-212	4.63E-212	684	869	869	1738	2.45	496	57.08	63	3.62	15.7679558
+																	
+# AME (Analysis of Motif Enrichment): Version 5.5.9 compiled on Nov 21 2025 at 19:28:00																	
+# The format of this file is described at https://meme-suite.org/meme/doc/ame-output-format.html.																	
+# ame --verbose 1 --oc . --bgfile bckgrnd.txt --scoring avg --method fisher --hit-lo-fraction 0.25 --evalue-report-threshold 10.0 --control --shuffle-- --kmer 2 sp6_tss_pool_distal_2kb_4c.bed.fa BNTAATTAYAGGBTK.meme																	

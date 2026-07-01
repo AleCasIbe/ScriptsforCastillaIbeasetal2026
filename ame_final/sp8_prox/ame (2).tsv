@@ -1,0 +1,6 @@
+rank	motif_DB	motif_ID	motif_alt_ID	consensus	p-value	adj_p-value	E-value	tests	FASTA_max	pos	neg	PWM_min	TP	%TP	FP	%FP	RE
+1	CCCSGCCCCGCCCCCYCCSS.meme	CCCSGCCCCGCCCCCYCCSS	MEME-1	CCCSGCCCCGCCCCCYCCSS	1.43E-49	8.11E-47	8.11E-47	567	340	340	1020	11.1	183	53.82	130	12.75	4.221176471
+																	
+# AME (Analysis of Motif Enrichment): Version 5.5.9 compiled on Nov 21 2025 at 19:28:00																	
+# The format of this file is described at https://meme-suite.org/meme/doc/ame-output-format.html.																	
+# ame --verbose 1 --oc . --bgfile Nuevo_documento_de_texto.txt --scoring avg --method fisher --hit-lo-fraction 0.25 --evalue-report-threshold 10.0 --control --shuffle-- --kmer 2 sp8_tss_pool_proxim_2kb_4c.bed.fa CCCSGCCCCGCCCCCYCCSS.meme																	

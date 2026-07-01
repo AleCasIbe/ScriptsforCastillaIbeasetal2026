@@ -1,0 +1,6 @@
+rank	motif_DB	motif_ID	motif_alt_ID	consensus	p-value	adj_p-value	E-value	tests	FASTA_max	pos	neg	PWM_min	TP	%TP	FP	%FP
+1	1-ASACAGAGMTG.meme	1-ASACAGAGMTG	STREME-1	ASACAGAGMTG	2.41e-6	8.02e-4	8.02e-4	333	48	48	1008	2.7	21	43.75	147	14.58
+
+# AME (Analysis of Motif Enrichment): Version 5.5.9 compiled on Nov 21 2025 at 19:28:00
+# The format of this file is described at https://meme-suite.org/meme/doc/ame-output-format.html.
+# ame --verbose 1 --oc . --bgfile bckgrf.txt --scoring avg --method fisher --hit-lo-fraction 0.25 --evalue-report-threshold 10.0 --control --shuffle-- --kmer 2 sp6_dtg_for_meme.bed.fa 1-ASACAGAGMTG.meme
