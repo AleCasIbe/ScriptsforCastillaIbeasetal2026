@@ -4,6 +4,6 @@ figures_and_source_data.R is the R script used to produce all figures and source
 
 In this script, some chunks are run on Linux command line and are only for informative purposes since the input files are too big
 
-To reproduce the figures generated on Linux command line, one would need to download fastq files from GEO and generate the input files from scratch
+To reproduce the figures generated on Linux command line, as well as scRNA-seq analysis, one would need to download fastq files from GEO and generate the input files from scratch
 
 For any request or question e-mail alejandrocastillaibeas@gmail.com
