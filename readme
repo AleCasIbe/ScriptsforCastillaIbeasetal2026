@@ -1,1 +1,7 @@
 ScriptsforCastillaIbeasetal2026
+
+Figures and Source data.R is the R script used to produce all figures and source data. 
+
+In this script, some chunks are run on linux and are only for informative purposes
+
+To reproduce the figures generated on linux, please download fastq files from GEO and generate the input files from scratch
