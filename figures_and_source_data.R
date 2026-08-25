@@ -14,6 +14,149 @@ library(RColorBrewer)
 library(pheatmap)
 library(ggpubr)
 library(ComplexHeatmap)
+library(circlize)
+
+############################
+######### helpers ##########
+
+# Row names of the count / VST matrices are "ENSMUSG00000025902.13|Sox17".
+# Heatmaps should label rows with the official gene symbol only.
+symbol_only <- function(x) {
+  ids <- if (is.null(dim(x))) x else rownames(x)
+  sym <- sub("^[^|]*\\|", "", ids)
+  # keep the Ensembl ID when no symbol is annotated
+  no_sym <- is.na(sym) | sym == ""
+  sym[no_sym] <- ids[no_sym]
+  # a few symbols map to more than one Ensembl ID
+  make.unique(sym)
+}
+
+# Percent of the variance carried by each PC, named PC1, PC2, ...
+pca_pct_var <- function(pca) {
+  setNames(round(100 * pca$sdev^2 / sum(pca$sdev^2), 1), paste0("PC", seq_along(pca$sdev)))
+}
+
+# Score table for plot_pca(). Groups are looked up in colData by sample name,
+# so they cannot drift out of step with the column order of the count matrix.
+pca_scores <- function(pca, coldata, group_col = "genotype") {
+  df <- as.data.frame(pca$x)
+  df$Sample <- rownames(df)
+  df$group  <- coldata[df$Sample, group_col]
+  df
+}
+
+# Font sizes for the QC panels. Raise these to scale the whole supplementary
+# figure at once - nothing below hard-codes a size.
+FONT_PCA     <- 24   # PCA base size (axis titles, legend)
+FONT_PCA_LAB <- 8    # PCA sample labels (ggplot mm units, ~23 pt)
+FONT_HM      <- 22   # heatmap column labels, title and legend
+FONT_HM_ROW  <- 14   # heatmap gene symbols
+
+# Shared PCA scatter - same style for the Sp6, Sp8 and DKO panels
+plot_pca <- function(df, pcx, pcy, pct_var = NULL, title = NULL) {
+  xlab <- if (!is.null(pct_var)) paste0(pcx, " (", pct_var[pcx], "%)") else pcx
+  ylab <- if (!is.null(pct_var)) paste0(pcy, " (", pct_var[pcy], "%)") else pcy
+  ggplot(df, aes_string(x = pcx, y = pcy, color = "group", label = "Sample")) +
+    geom_point(size = 5) +
+    geom_text_repel(size = FONT_PCA_LAB, min.segment.length = 0, seed = 12) +
+    labs(title = if (is.null(title)) paste("PCA:", pcx, "vs", pcy) else title,
+         x = xlab, y = ylab) +
+    theme_minimal(base_size = FONT_PCA) +
+    theme(plot.title   = element_text(size = FONT_PCA + 2, face = "bold"),
+          axis.text    = element_text(size = FONT_PCA - 2),
+          legend.text  = element_text(size = FONT_PCA - 2))
+}
+
+# Shared heatmap for the top PCA-driving genes.
+
+pca_heatmap <- function(mat, file, main, cluster_cols = FALSE,
+                        show_rownames = FALSE, height = NULL,
+                        width = 7) {
+  mat <- as.matrix(mat)
+  pdf(file, height = height, width = width)
+  ht <- pheatmap(mat, scale = "row",
+                 clustering_distance_rows = "correlation",
+                 cluster_cols  = cluster_cols,
+                 show_rownames = show_rownames, show_colnames = TRUE,
+                 main          = main,
+                 fontsize      = FONT_HM,
+                 fontsize_row  = FONT_HM_ROW,
+                 fontsize_col  = FONT_HM,
+                 name = "Row Z-score")
+  if (inherits(ht, c("Heatmap", "HeatmapList"))) ComplexHeatmap::draw(ht)
+  dev.off()
+}
+
+#############################################
+######### Source Data file (ncomms) #########
+#############################################
+# Nature Communications asks for one 'Source Data' file holding, on a separate
+# sheet per figure panel, the raw values behind every graph
+# (https://www.nature.com/documents/ncomms-example-source-data.xlsx).
+# Each plotting block below stashes the exact data it draws with
+# add_source_data(); write_source_data() - the last line of this script -
+# then writes the whole workbook in one go, with an Index sheet first.
+# Sheets are collected in the R session, so run the plotting sections you
+# need and call write_source_data() at any point to (re)write the file.
+# Panels whose graphs are not made in R (RNAscope and luciferase
+# quantifications, EMSA/BiFC/co-IP images, deepTools heatmaps, MEME logos)
+# have to be added to the workbook by hand - see the note at write_source_data().
+
+SOURCE_DATA_XLSX <- "revisions/output/Source_Data.xlsx"
+
+add_source_data <- function(sheet, df, description = "") {
+  stopifnot(nchar(sheet) <= 31)                # Excel sheet-name limit
+  if (!exists("SD_SHEETS", envir = .GlobalEnv)) assign("SD_SHEETS", list(), envir = .GlobalEnv)
+  if (!exists("SD_INDEX",  envir = .GlobalEnv)) assign("SD_INDEX",  list(), envir = .GlobalEnv)
+  df <- as.data.frame(df)
+  rownames(df) <- NULL
+  SD_SHEETS[[sheet]] <<- df
+  SD_INDEX[[sheet]]  <<- data.frame(Sheet = sheet, Description = description)
+  invisible(df)
+}
+
+# Membership table behind a Venn/Euler diagram: one row per gene,
+# one TRUE/FALSE column per set. Takes the same named list fed to eulerr.
+sd_overlap <- function(sets) {
+  genes <- sort(unique(unlist(sets)))
+  out <- data.frame(gene = genes)
+  for (nm in names(sets)) out[[nm]] <- genes %in% sets[[nm]]
+  out
+}
+
+# Values behind a GREAT GO dot plot (Term / Count / Gene ratio / FDR)
+sd_great_go <- function(df) data.frame(
+  GO_term         = df$V3,
+  Count           = df$V19,
+  Total_genes     = df$V20,
+  Gene_ratio      = df$V19 / df$V20,
+  FDR             = df$V16,
+  minus_log10_FDR = -log10(df$V16))
+
+# Values behind a DAVID GO dot plot (pcol differs between .txt and .csv exports).
+# The dot colour encodes the UNADJUSTED EASE p-value, so the BH-adjusted values
+# DAVID reports are carried along too - the figure legend states which was used.
+sd_david_go <- function(df, pcol = "PValue") {
+  out <- data.frame(
+    GO_term       = df$Term,
+    Count         = df$Count,
+    Pop_hits      = df$Pop.Hits,
+    Gene_ratio    = df$Count / df$Pop.Hits,
+    P_value       = df[[pcol]],
+    minus_log10_P = -log10(df[[pcol]]))
+  if ("Benjamini" %in% colnames(df)) out$Benjamini_BH <- df$Benjamini
+  if ("FDR"       %in% colnames(df)) out$FDR          <- df$FDR
+  out
+}
+
+write_source_data <- function(path = SOURCE_DATA_XLSX) {
+  nm <- names(SD_SHEETS)
+  nm <- c(sort(nm[startsWith(nm, "Figure")]), sort(nm[!startsWith(nm, "Figure")]))
+  index <- do.call(rbind, SD_INDEX[nm])
+  writexl::write_xlsx(c(list(Index = index), SD_SHEETS[nm]), path)
+  message("Source Data written: ", path, " (", length(nm), " data sheets)")
+}
+
 ############################
 ######### figure 1 #########
 
@@ -65,7 +208,7 @@ sp8_tss_sd1 <- sp8_tss
 colnames(sp8_tss_sd1) <- c("chr","start","end","peak_id","gene_chr",
                            "gene_start","gene_end","gene","distance",
                            "distance_kb","distance_label", "Distance_Group")
-# --- Make the Source data 1 with IDR values
+# --- Make the Supplementary Data 1 with IDR values
 sp6_sd1 <- read.table("revisions/idr_redo/results/sp6_idrOptPeaks_pool.bed", header=FALSE)
 sp8_sd1 <- read.table("revisions/idr_redo/results/sp8_idrOptPeaks_pool.bed", header=FALSE)
 colnames(sp6_sd1) <- c("chr","start","end","def_name","IDR_score_sc",
@@ -85,8 +228,8 @@ sp6_tss_sd1 <- merge(sp6_tss_sd1, sp6_sd1, by="peak_id")
 sp8_tss_sd1 <- merge(sp8_tss_sd1, sp8_sd1, by="peak_id")
 
 # --- Save annotated tables ---
-xlsx::write.xlsx(sp8_tss_sd1[,c(1:12,17,19:24)], "revisions/output/Source_data1_sp8_sp6_peaks_2kb.xlsx", sheetName="Sp8_peaks")
-xlsx::write.xlsx(sp8_tss_sd1[,c(1:12,17,19:24)], "revisions/output/Source_data1_sp8_sp6_peaks_2kb.xlsx", sheetName="Sp6_peaks", append=TRUE)
+xlsx::write.xlsx(sp8_tss_sd1[,c(1:12,17,19:24)], "revisions/output/Supplementary_Data_1_sp8_sp6_peaks_2kb.xlsx", sheetName="Sp8_peaks")
+xlsx::write.xlsx(sp6_tss_sd1[,c(1:12,17,19:24)], "revisions/output/Supplementary_Data_1_sp8_sp6_peaks_2kb.xlsx", sheetName="Sp6_peaks", append=TRUE)
 
 # --- Colors ---
 fill_sp8 <- c("mediumorchid1","mediumorchid1","mediumorchid1",
@@ -128,6 +271,14 @@ ggplot(data.frame(distance = signed_log_distance), aes(x = distance)) +
          legend.position = "top")
 ggsave("D:/ChIP/revisions/Plots/density_plots_Sp6.png",dpi = 300, height = 4, width=5)
 
+add_source_data("Figure 1b Sp6",
+  data.frame(chr = sp6_tss$V1, start = sp6_tss$V2, end = sp6_tss$V3,
+             peak_id = sp6_tss$V4, nearest_gene = sp6_tss$V8,
+             distance_to_TSS_kb = sp6_tss$V10,
+             signed_log10_distance = sign(sp6_tss$V10) * log10(abs(sp6_tss$V10) + 1),
+             location = sp6_tss$distance_label),
+  "Fig 1b (Sp6): distance to the nearest TSS of each Sp6 ChIP-seq peak, plotted as density")
+
 ###SP8
 signed_log_distance8 <- sign(sp8_tss$V10) * log10(abs(sp8_tss$V10) + 1)
 ggplot(data.frame(distance = signed_log_distance8), aes(x = distance)) +
@@ -158,6 +309,14 @@ ggplot(data.frame(distance = signed_log_distance8), aes(x = distance)) +
          ,axis.text.x=element_text(angle = -45, vjust = -0.5),
          legend.position = "top")
 ggsave("D:/ChIP/revisions/Plots/density_plots_Sp8.png",dpi = 300, height = 4, width=5)
+
+add_source_data("Figure 1b Sp8",
+  data.frame(chr = sp8_tss$V1, start = sp8_tss$V2, end = sp8_tss$V3,
+             peak_id = sp8_tss$V4, nearest_gene = sp8_tss$V8,
+             distance_to_TSS_kb = sp8_tss$V10,
+             signed_log10_distance = sign(sp8_tss$V10) * log10(abs(sp8_tss$V10) + 1),
+             location = sp8_tss$distance_label),
+  "Fig 1b (Sp8): distance to the nearest TSS of each Sp8 ChIP-seq peak, plotted as density")
 
 # ##BOTH
 # # --- Transform both datasets ---
@@ -242,9 +401,9 @@ sp6_distal <- sp6_distal %>% filter(V1=="GO Biological Process" & V16 < 0.05) %>
 sp8_distal <-   sp8_distal %>% filter(V1=="GO Biological Process" & V16 < 0.05) %>% mutate(FDR=V16) %>% mutate(Count=V19)
 sp8_proximal <- sp8_proximal %>% filter(V1=="GO Biological Process" & V16 < 0.05) %>% mutate(FDR=V16) %>% mutate(Count=V19)
 
-write.xlsx(sp8_proximal, "D:/ChIP/revisions/output/Source_data_2_GREAT_BP_terms.xlsx", sheetName="Sp8_proximal")
-write.xlsx(sp8_distal, "D:/ChIP/revisions/output/Source_data_2_GREAT_BP_terms.xlsx", sheetName="Sp8_distal", append=TRUE)
-write.xlsx(sp6_distal, "D:/ChIP/revisions/output/Source_data_2_GREAT_BP_terms.xlsx", sheetName="Sp6_distal", append=TRUE) 
+write.xlsx(sp8_proximal, "D:/ChIP/revisions/output/Supplementary_Data_2_GREAT_BP_terms.xlsx", sheetName="Sp8_proximal")
+write.xlsx(sp8_distal, "D:/ChIP/revisions/output/Supplementary_Data_2_GREAT_BP_terms.xlsx", sheetName="Sp8_distal", append=TRUE)
+write.xlsx(sp6_distal, "D:/ChIP/revisions/output/Supplementary_Data_2_GREAT_BP_terms.xlsx", sheetName="Sp6_distal", append=TRUE) 
 
 
 ####################### GO terms fig 1 ##############
@@ -290,6 +449,13 @@ combined_plot <- plot_grid( p2, p1, p5,p5, nrow = 2,
                             ) 
 ggsave("D:/ChIP/revisions/Plots/Great_bpe_Fig1_aligned_plots.pdf", combined_plot, width = 11, height = 6.5)
 
+add_source_data("Figure 1c Sp8 proximal GO", sd_great_go(sp8_proximal[c(2,4,6,9,11), ]),
+  "Fig 1c (left): GREAT GO Biological Process terms shown for Sp8 proximal peaks")
+add_source_data("Figure 1c Sp8 distal GO", sd_great_go(sp8_distal[c(1,2, 4, 6,8), ]),
+  "Fig 1c (right): GREAT GO Biological Process terms shown for Sp8 distal peaks")
+add_source_data("Figure 1d Sp6 distal GO", sd_great_go(sp6_distal[c(1,2,3,7,9), ]),
+  "Fig 1d: GREAT GO Biological Process terms shown for Sp6 distal peaks")
+
 
 ##### d heatmaps proximal distal ######
 #data from cistrome galaxy server- input sp6 and sp8 optimal pool peaks and run default in mm10 genome
@@ -317,6 +483,13 @@ plot(x,y1,type="l",col="chartreuse2", lwd=3,
 abline(v=0, lwd=1)
 legend("topright",c('Sp6'),col=c("chartreuse2"),lty=c(1), lwd=c(3),cex = 1.2)
 dev.off()
+
+add_source_data("Supp phastcons Sp8",
+  data.frame(distance_from_center_bp = x, average_phastcons = y0),
+  "Supplementary: average PhastCons conservation around Sp8 peak centers (Cistrome)")
+add_source_data("Supp phastcons Sp6",
+  data.frame(distance_from_center_bp = x, average_phastcons = y1),
+  "Supplementary: average PhastCons conservation around Sp6 peak centers (Cistrome)")
 
 
 ##################### HEATMAPS FIG S2 ######################
@@ -399,67 +572,7 @@ dev.off()
 # -o /home/castillaa/chip/heatmaps/sp6_pool_peaks_in_sp6_r3.pdf --startLabel center \
 # --colorMap  bwr --legendLocation none --zMax 0.8
 # 
-# ##signal in dlx5 --------------------------------
-# computeMatrix reference-point -S /home/castillaa/chip/revisions/input/DLX5_HL_11.bw \
-# /home/castillaa/chip/revisions/input/DLX5_FL_11.bw \
-# /home/castillaa/chip/revisions/input/DLX5_BA_11.bw \
-# -R //home/castillaa/chip/revisions/input/sp8_pool_4cs.bed \
-# -a 3000 -b 3000 -p 16 \
-# -o /home/castillaa/chip/bigwigs_bamcoverage/matrix/sp8_pool_peaks_in_dlx5.gz --referencePoint center 
 # 
-# plotHeatmap -m /home/castillaa/chip/bigwigs_bamcoverage/matrix/sp8_pool_peaks_in_dlx5.gz \
-# -o /home/castillaa/chip/heatmaps/sp8_pool_peaks_in_dlx5.pdf --startLabel center \
-# --colorMap  bwr --legendLocation none 
-# 
-# # --zMax 7.5 7.5 4 4 
-# 
-# 
-# computeMatrix reference-point -S /home/castillaa/chip/revisions/input/DLX5_HL_11.bw \
-# /home/castillaa/chip/revisions/input/DLX5_FL_11.bw \
-# /home/castillaa/chip/revisions/input/DLX5_BA_11.bw \
-# -R //home/castillaa/chip/revisions/input/sp6_pool_4cs.bed \
-# -a 3000 -b 3000 -p 16 \
-# -o /home/castillaa/chip/bigwigs_bamcoverage/matrix/sp6_pool_peaks_in_dlx5.gz --referencePoint center 
-# 
-# plotHeatmap -m /home/castillaa/chip/bigwigs_bamcoverage/matrix/sp6_pool_peaks_in_dlx5.gz \
-# -o /home/castillaa/chip/heatmaps/sp6_pool_peaks_in_dlx5.pdf --startLabel center \
-# --colorMap  bwr --legendLocation none 
-# 
-# # --zMax 7.5 7.5 4 4 
-# 
-# ##signal in dlx5 common peaks--------------------------------
-# computeMatrix reference-point -S /home/castillaa/chip/revisions/input/DLX5_HL_11.bw \
-# /home/castillaa/chip/revisions/input/DLX5_FL_11.bw \
-# /home/castillaa/chip/revisions/input/DLX5_BA_11.bw \
-# -R //home/castillaa/chip/revisions/input/common_with_gb_for_great_s.bed \
-# -a 3000 -b 3000 -p 16 \
-# -o /home/castillaa/chip/bigwigs_bamcoverage/matrix/common_pool_peaks_in_dlx5.gz --referencePoint center 
-# 
-# plotHeatmap -m /home/castillaa/chip/bigwigs_bamcoverage/matrix/common_pool_peaks_in_dlx5.gz \
-# -o /home/castillaa/chip/heatmaps/common_pool_peaks_in_dlx5.pdf --startLabel center \
-# --colorMap  bwr --legendLocation none 
-# 
-# # --zMax 7.5 7.5 4 4 
-# 
-# 
-# computeMatrix reference-point -S /home/castillaa/chip/revisions/input/DLX5_HL_11.bw \
-# /home/castillaa/chip/revisions/input/DLX5_FL_11.bw \
-# /home/castillaa/chip/revisions/input/DLX5_BA_11.bw \
-# -R //home/castillaa/chip/revisions/input/sp8_bpe_for_great_s.bed \
-# -a 3000 -b 3000 -p 16 \
-# -o /home/castillaa/chip/bigwigs_bamcoverage/matrix/sp8_spe_pool_peaks_in_dlx5.gz --referencePoint center 
-# 
-# plotHeatmap -m /home/castillaa/chip/bigwigs_bamcoverage/matrix/sp8_spe_pool_peaks_in_dlx5.gz \
-# -o /home/castillaa/chip/heatmaps/sp8_spe_pool_peaks_in_dlx5.pdf --startLabel center \
-# --colorMap  bwr --legendLocation none 
-# 
-# 
-# bedtools intersect -a DLX5_HL_11_merge_p001_peaks.narrowPeak \
-# -b /home/castillaa/chip/revisions/input/sp8_bpe_for_great_s.bed \
-# > intersect_dlx5_hl_sp8_spe.bed
-# awk -F'\t' 'BEGIN{OFS="\t"} {print $1, $2, $3, $4}' /home/castillaa/chip/revisions/input/intersect_dlx5_hl_sp8_spe.bed > /home/castillaa/chip/revisions/input/intersect_dlx5_hl_sp8_spe.bed_4c.bed
-# 
-# # --zMax 7.5 7.5 4 4 
 # #####correlation--------------------------------------
 # 
 # multiBamSummary bins --bamfiles /home/castillaa/chip/IDR/idr_redo/sp8/rochp_sp8_rep1_sorted_filt_chr.bam \
@@ -626,21 +739,19 @@ pca_df_sp8 <- as.data.frame(gene_pca_sp8$x)
 
 # Add sample names or conditions for coloring if available
 # Here, we're just using sample names
-pca_df_sp8$Sample <- rownames(pca_df_sp8)
-pca_df_sp8$group <- c("sp8_KO","sp8_KO","sp8_KO",
-                      "sp8_WT","sp8_WT","sp8_WT")
+pca_df_sp8  <- pca_scores(gene_pca_sp8, colData_sp8)
+pct_var_sp8 <- pca_pct_var(gene_pca_sp8)
 
 # Plot PC1 vs PC2
-ggplot(pca_df_sp8, aes(x = PC1, y = PC2, label = Sample, color=group)) +
-  geom_point(size=5) +
-  geom_text_repel(aes(label=Sample), size=5) +
-  labs(title = "PCA: PC1 vs PC2",
-       x = "Principal Component 1",
-       y = "Principal Component 2") +
-  ylim(c(-20,20))
+plot_pca(pca_df_sp8, "PC1", "PC2", pct_var_sp8, title = "PCA: Sp8")
 
 # ggsave("revisions/Plots/PCA_sp8_1.png")
 ggsave("revisions/Plots/PCA_sp8_1_prev.png")
+
+add_source_data("Supp PCA Sp8 all reps",
+  data.frame(pca_df_sp8[, c("Sample", "group", "PC1", "PC2")],
+             pct_var_PC1 = pct_var_sp8[["PC1"]], pct_var_PC2 = pct_var_sp8[["PC2"]]),
+  "Supplementary QC: PCA scores of Sp8 RNA-seq samples before replicate filtering")
 
 # Extract the loadings (rotation) matrix
 loadings_sp8 <- gene_pca_sp8$rotation
@@ -660,16 +771,24 @@ top_genes_pc2_sp8
 # Get the names of the top 100 genes
 top_genes_pc1_sp8 <- rownames(loadings_sp8)[top_100_genes_pc1_sp8]
 top_genes_pc2_sp8 <- rownames(loadings_sp8)[top_100_genes_pc2_sp8]
-# Subset the original gene expression matrix to include only the top 100 genes
-top_genes_matrix_sp8 <- countDa_sp8[top_genes_pc1_sp8,c(1:6) ]
-top_genes_matrix_pc2_sp8 <- countDa_sp8[top_genes_pc2_sp8,c(1:6) ]
+# Subset the VST matrix to include only the top genes
+top_genes_matrix_sp8 <- vst_sp8_assay[top_genes_pc1_sp8, ]
+top_genes_matrix_pc2_sp8 <- vst_sp8_assay[top_genes_pc2_sp8, ]
 
-# Create a heatmap of the top 100 genes
-pdf("heatmaps/top250_counts_sp8_f.pdf",height = 30)
-pheatmap(top_genes_matrix_sp8, scale = "row", clustering_distance_rows = "correlation"
-         , show_rownames = TRUE, show_colnames = TRUE,
-         main = "Heatmap of Top 250 Genes Impacting PC1 _sp8",cluster_cols = F)
-dev.off()
+# label rows with the gene symbol only
+rownames(top_genes_matrix_sp8)     <- symbol_only(top_genes_matrix_sp8)
+rownames(top_genes_matrix_pc2_sp8) <- symbol_only(top_genes_matrix_pc2_sp8)
+
+# Create a heatmap of the top PC1 genes
+pca_heatmap(top_genes_matrix_sp8, "heatmaps/top250_vst_sp8_prev.pdf",
+            "Top 250 PC1 genes - Sp8")
+pca_heatmap(top_genes_matrix_sp8, "heatmaps/top250_vst_sp8_prev_colclustered.pdf",
+            "Top 250 PC1 genes - Sp8", cluster_cols = TRUE)
+
+add_source_data("Supp heatmap Sp8 all reps",
+  data.frame(gene = rownames(top_genes_matrix_sp8), top_genes_matrix_sp8, check.names = FALSE),
+  "Supplementary QC: VST expression of the top 250 PC1 genes, Sp8 samples before replicate filtering (heatmap shows row-scaled values)")
+
 
 ############## QC SP6 ###########
 
@@ -689,23 +808,18 @@ pca_df_sp6 <- as.data.frame(gene_pca_sp6$x)
 
 # Add sample names or conditions for coloring if available
 # Here, we're just using sample names
-pca_df_sp6$Sample <- rownames(pca_df_sp6)
-pca_df_sp6$group <- c("sp6_KO",
-                      "sp6_KO",
-                      "sp6_KO",
-                      "sp6_WT",
-                      "sp6_WT",
-                      "sp6_WT")
+pca_df_sp6  <- pca_scores(gene_pca_sp6, colData_sp6)
+pct_var_sp6 <- pca_pct_var(gene_pca_sp6)
 
 # Plot PC1 vs PC2
-ggplot(pca_df_sp6, aes(x = PC1, y = PC2, label = Sample, color=group)) +
-  geom_point(size=5) +
-  geom_text_repel(aes(label=Sample), size=5) +
-  labs(title = "PCA: PC1 vs PC2",
-       x = "Principal Component 1",
-       y = "Principal Component 2")  
+plot_pca(pca_df_sp6, "PC1", "PC2", pct_var_sp6, title = "PCA: Sp6")
 # ggsave("revisions/Plots/PCA_sp6_1.png")
-ggsave("revisions/Plots/PCA_sp6_1_after.png")
+ggsave("revisions/Plots/PCA_sp6_1_prev.png")
+
+add_source_data("Supp PCA Sp6 all reps",
+  data.frame(pca_df_sp6[, c("Sample", "group", "PC1", "PC2")],
+             pct_var_PC1 = pct_var_sp6[["PC1"]], pct_var_PC2 = pct_var_sp6[["PC2"]]),
+  "Supplementary QC: PCA scores of Sp6 RNA-seq samples before replicate filtering")
 
 # Extract the loadings (rotation) matrix
 loadings_sp6 <- gene_pca_sp6$rotation
@@ -725,16 +839,23 @@ top_genes_pc2_sp6
 # Get the names of the top 100 genes
 top_genes_pc1_sp6 <- rownames(loadings_sp6)[top_100_genes_pc1_sp6]
 top_genes_pc2_sp6 <- rownames(loadings_sp6)[top_100_genes_pc2_sp6]
-# Subset the original gene expression matrix to include only the top 100 genes
-top_genes_matrix_sp6 <- countDa_sp6[top_genes_pc1_sp6,c(1:6) ]
-top_genes_matrix_pc2_sp6 <- countDa_sp6[top_genes_pc2_sp6,c(1:6) ]
+# Subset the VST matrix to include only the top genes
+top_genes_matrix_sp6 <- vst_sp6_assay[top_genes_pc1_sp6, ]
+top_genes_matrix_pc2_sp6 <- vst_sp6_assay[top_genes_pc2_sp6, ]
 
-# Create a heatmap of the top 100 genes
-pdf("heatmaps/top250_counts_sp6_f_f.pdf",height = 30)
-pheatmap(top_genes_matrix_sp6, scale = "row", clustering_distance_rows = "correlation"
-         , show_rownames = TRUE, show_colnames = TRUE,
-         main = "Heatmap of Top 250 Genes Impacting PC1 _sp6",cluster_cols = F)
-dev.off()
+# label rows with the gene symbol only
+rownames(top_genes_matrix_sp6)     <- symbol_only(top_genes_matrix_sp6)
+rownames(top_genes_matrix_pc2_sp6) <- symbol_only(top_genes_matrix_pc2_sp6)
+
+# Create a heatmap of the top PC1 genes
+pca_heatmap(top_genes_matrix_sp6, "heatmaps/top250_vst_sp6_prev.pdf",
+            "Top 250 PC1 genes - Sp6, all replicates")
+pca_heatmap(top_genes_matrix_sp6, "heatmaps/top250_vst_sp6_prev_colclustered.pdf",
+            "Top 250 PC1 genes - Sp6, all replicates", cluster_cols = TRUE)
+
+add_source_data("Supp heatmap Sp6 all reps",
+  data.frame(gene = rownames(top_genes_matrix_sp6), top_genes_matrix_sp6, check.names = FALSE),
+  "Supplementary QC: VST expression of the top 250 PC1 genes, Sp6 samples before replicate filtering (heatmap shows row-scaled values)")
 
 
 ################ POST-FILTERING ANALYSIS #############
@@ -808,9 +929,10 @@ vst_sp8 <- vst(dds_sp8, blind = T)
 ##################
 ####pca sp8#######
 ##################
-##put the names back again in the rownames
-row.names(countDa_sp8) <- countDa_sp8$gene_id
-countDa_sp8 <- countDa_sp8[,c(1:5)]
+## countDa_sp8 has no gene_id column here, so this reset the rownames to 1..N.
+## No longer needed: the heatmap below is built from vst_sp8_assay.
+# row.names(countDa_sp8) <- countDa_sp8$gene_id
+# countDa_sp8 <- countDa_sp8[,c(1:5)]
 
 # Plot PCA
 plotPCA(vst_sp8, intgroup = "genotype")
@@ -826,21 +948,19 @@ pca_df_sp8 <- as.data.frame(gene_pca_sp8$x)
 
 # Add sample names or conditions for coloring if available
 # Here, we're just using sample names
-pca_df_sp8$Sample <- rownames(pca_df_sp8)
-pca_df_sp8$group <- c("sp8_KO","sp8_KO",
-                      "sp8_WT","sp8_WT","sp8_WT")
+pca_df_sp8  <- pca_scores(gene_pca_sp8, colData_sp8)
+pct_var_sp8 <- pca_pct_var(gene_pca_sp8)
 
 # Plot PC1 vs PC2
-ggplot(pca_df_sp8, aes(x = PC1, y = PC2, label = Sample, color=group)) +
-  geom_point(size=5) +
-  geom_text_repel(aes(label=Sample), size=5) +
-  labs(title = "PCA: PC1 vs PC2",
-       x = "Principal Component 1",
-       y = "Principal Component 2") +
-  ylim(c(-20,20))
+plot_pca(pca_df_sp8, "PC1", "PC2", pct_var_sp8, title = "PCA: Sp8 - after replicate filtering")
 
 # ggsave("revisions/Plots/PCA_sp8_1.png")
 ggsave("revisions/Plots/PCA_sp8_1_after.png")
+
+add_source_data("Supp PCA Sp8 filtered",
+  data.frame(pca_df_sp8[, c("Sample", "group", "PC1", "PC2")],
+             pct_var_PC1 = pct_var_sp8[["PC1"]], pct_var_PC2 = pct_var_sp8[["PC2"]]),
+  "Supplementary QC: PCA scores of Sp8 RNA-seq samples after replicate filtering")
 
 # Extract the loadings (rotation) matrix
 loadings_sp8 <- gene_pca_sp8$rotation
@@ -851,16 +971,21 @@ top_100_genes_pc1_sp8 <- head(order(abs(loadings_sp8[, 1]), decreasing = TRUE), 
 # Display the top 100 genes
 top_genes_pc1_sp8 <- rownames(loadings_sp8)[top_100_genes_pc1_sp8]
 
-# Subset the original gene expression matrix to include only the top 100 genes
-top_genes_matrix_sp8 <- countDa_sp8[top_genes_pc1_sp8,c(1:5) ]
+# Subset the VST matrix to include only the top genes
+top_genes_matrix_sp8 <- vst_sp8_assay[top_genes_pc1_sp8, ]
 
-# Create a heatmap of the top 100 genes
-pdf("heatmaps/top250_counts_sp8_f.pdf",height = 30)
-pheatmap(top_genes_matrix_sp8, scale = "row", clustering_distance_rows = "correlation"
-         , show_rownames = TRUE, show_colnames = TRUE,
-         main = "Heatmap of Top 250 Genes Impacting PC1 _sp8",cluster_cols = F)
-dev.off()
+# label rows with the gene symbol only
+rownames(top_genes_matrix_sp8) <- symbol_only(top_genes_matrix_sp8)
 
+# Create a heatmap of the top PC1 genes
+pca_heatmap(top_genes_matrix_sp8, "revisions/plots/top250_vst_sp8_after.pdf",
+            "Top 250 PC1 genes - Sp8, after replicate filtering")
+pca_heatmap(top_genes_matrix_sp8, "revisions/plots/top250_vst_sp8_after_colclustered.pdf",
+            "Top 250 PC1 genes - Sp8, after replicate filtering", cluster_cols = TRUE, height = 40,show_rownames = T)
+
+add_source_data("Supp heatmap Sp8 filtered",
+  data.frame(gene = rownames(top_genes_matrix_sp8), top_genes_matrix_sp8, check.names = FALSE),
+  "Supplementary QC: VST expression of the top 250 PC1 genes, Sp8 samples after replicate filtering (heatmap shows row-scaled values)")
 #transfer rownames into columns
 resOrdered_sp8$names <- rownames(resOrdered_sp8)
 resOrdered_sp8 <- resOrdered_sp8 %>% separate(names, into = c("Gene.ID", "Gene.name"), sep = "\\|")
@@ -956,6 +1081,12 @@ TPM_sp6 <- TPM_sp6[,c(1,2,9,16,23,30
 colnames(countDa_sp6) <- gsub("RNASEQ_ect_", "", colnames(countDa_sp6))
 countDa_sp6 <- as.data.frame(countDa_sp6)
 
+### renumber the surviving replicates so the PCA / heatmap labels match the
+### TPM columns of Supplementary Data 3: KO_rep2 -> KO_rep1, KO_rep3 -> KO_rep2,
+### WT_rep1 -> WT_rep1, WT_rep3 -> WT_rep2
+colnames(countDa_sp6)  <- c("sp6_KO_rep1", "sp6_KO_rep2", "sp6_WT_rep1", "sp6_WT_rep2")
+rownames(colData_sp6)  <- colnames(countDa_sp6)
+
 dds_sp6 <- DESeqDataSetFromMatrix(countData = countDa_sp6,
                                   colData = colData_sp6, design = ~ genotype)
 
@@ -992,10 +1123,72 @@ table(duplicated(sp6_deg$Gene.name))
 # 
 # write.csv(sp6_deg_pval, "output/sp6_degs_pval_for_david.txt")
 
+############## QC SP6 ###########
 
+vst_sp6 <- vst(dds_sp6, blind=T)
 
+# Plot PCA
+plotPCA(vst_sp6, intgroup = "genotype")
 
+#other pcs
+vst_sp6_assay <- as.data.frame(assay(vst_sp6))
 
+# Perform PCA on the gene expression matrix
+gene_pca_sp6 <- prcomp(t(vst_sp6_assay), scale. = F)
+
+# Create a dataframe with the principal components
+pca_df_sp6 <- as.data.frame(gene_pca_sp6$x)
+
+# Add sample names or conditions for coloring if available
+# Here, we're just using sample names
+pca_df_sp6  <- pca_scores(gene_pca_sp6, colData_sp6)
+pct_var_sp6 <- pca_pct_var(gene_pca_sp6)
+
+# Plot PC1 vs PC2
+plot_pca(pca_df_sp6, "PC1", "PC2", pct_var_sp6, title = "PCA: Sp6 - after replicate filtering")
+# ggsave("revisions/Plots/PCA_sp6_1.png")
+ggsave("revisions/Plots/PCA_sp6_1_after.png")
+
+add_source_data("Supp PCA Sp6 filtered",
+  data.frame(pca_df_sp6[, c("Sample", "group", "PC1", "PC2")],
+             pct_var_PC1 = pct_var_sp6[["PC1"]], pct_var_PC2 = pct_var_sp6[["PC2"]]),
+  "Supplementary QC: PCA scores of Sp6 RNA-seq samples after replicate filtering")
+
+# Extract the loadings (rotation) matrix
+loadings_sp6 <- gene_pca_sp6$rotation
+
+# Determine the top 100 genes that impact PC1 the most
+top_100_genes_pc1_sp6 <- head(order(abs(loadings_sp6[, 1]), decreasing = TRUE), 250)
+
+# Display the top 100 genes
+top_genes_pc1_sp6 <- rownames(loadings_sp6)[top_100_genes_pc1_sp6]
+top_genes_pc1_sp6
+
+# If you are interested in other principal components, e.g., PC2
+top_100_genes_pc2_sp6 <- head(order(abs(loadings_sp6[, 2]), decreasing = TRUE), 250)
+top_genes_pc2_sp6 <- rownames(loadings_sp6)[top_100_genes_pc2_sp6]
+top_genes_pc2_sp6
+
+# Get the names of the top 100 genes
+top_genes_pc1_sp6 <- rownames(loadings_sp6)[top_100_genes_pc1_sp6]
+top_genes_pc2_sp6 <- rownames(loadings_sp6)[top_100_genes_pc2_sp6]
+# Subset the VST matrix to include only the top genes
+top_genes_matrix_sp6 <- vst_sp6_assay[top_genes_pc1_sp6, ]
+top_genes_matrix_pc2_sp6 <- vst_sp6_assay[top_genes_pc2_sp6, ]
+
+# label rows with the gene symbol only
+rownames(top_genes_matrix_sp6)     <- symbol_only(top_genes_matrix_sp6)
+rownames(top_genes_matrix_pc2_sp6) <- symbol_only(top_genes_matrix_pc2_sp6)
+
+# Create a heatmap of the top PC1 genes
+pca_heatmap(top_genes_matrix_sp6, "heatmaps/top250_vst_sp6_after.pdf",
+            "Top 250 PC1 genes - Sp6, after replicate filtering")
+pca_heatmap(top_genes_matrix_sp6, "heatmaps/top250_vst_sp6_after_colclustered.pdf",
+            "Top 250 PC1 genes - Sp6, after replicate filtering", cluster_cols = TRUE)
+
+add_source_data("Supp heatmap Sp6 filtered",
+  data.frame(gene = rownames(top_genes_matrix_sp6), top_genes_matrix_sp6, check.names = FALSE),
+  "Supplementary QC: VST expression of the top 250 PC1 genes, Sp6 samples after replicate filtering (heatmap shows row-scaled values)")
 ########################################
 ############ DESeq2 - DKO  #############
 ########################################
@@ -1031,6 +1224,17 @@ all(rownames(colData) %in% colnames(countDa))
 countDa <- countDa[, rownames(colData)]
 all(rownames(colData) == colnames(countDa))
 
+### Display names: the sequencing IDs carry no information, so number the
+### replicates within each genotype. Applied to colData / countDa here and to
+### the TPM columns below, so the PCA, the heatmaps and the exported tables all
+### use the same labels.
+DKO_SAMPLES <- setNames(c("WT_rep1", "WT_rep2", "WT_rep3",
+                          "DKO_rep1", "DKO_rep2", "DKO_rep3"),
+                        rownames(colData))
+
+colnames(countDa)  <- DKO_SAMPLES[colnames(countDa)]
+rownames(colData)  <- DKO_SAMPLES[rownames(colData)]
+
 ########################################
 ##### Pre-filtering low-count genes ####
 ########################################
@@ -1050,10 +1254,6 @@ cat("Genes after filtering:", nrow(countDa), "\n")
 ##### Load and merge TPM tables ########
 ########################################
 
-# Genes to exclude (high-variance contaminants / non-informative)
-exclude_genes <- c("Hbb-bs", "Hbb-bt", "Hbb-bh1", "Hbb-bh2", "Hbb-y",
-                   "Hba-a1", "Hba-a2", "Hba-x")  # full globin family
-
 samples <- c("RNA_WT_32", "RNA_WT_53", "RNA_WT_56",
              "RNA_DKO_17", "RNA_DKO_40", "RNA_DKO_41")
 
@@ -1068,7 +1268,8 @@ tpm_list <- lapply(samples, function(s) {
   # Remove globin genes
   # df <- df %>% filter(!Gene.Name %in% exclude_genes)
   
-  df <- df %>% dplyr::rename(!!paste0("TPM_", s) := TPM)
+  # file names keep the sequencing IDs, columns get the replicate display names
+  df <- df %>% dplyr::rename(!!paste0("TPM_", DKO_SAMPLES[[s]]) := TPM)
   df
 })
 
@@ -1076,7 +1277,7 @@ TPM_all <- tpm_list[[1]]
 for (i in 2:length(tpm_list)) {
   TPM_all <- inner_join(TPM_all, tpm_list[[i]], by = c("Gene.ID", "Gene.Name"))
 }
-TPM_all <- TPM_all[, c("Gene.ID", "Gene.Name", paste0("TPM_", samples))]
+TPM_all <- TPM_all[, c("Gene.ID", "Gene.Name", paste0("TPM_", DKO_SAMPLES[samples]))]
 
 ########################################
 ###### Helper: format DESeq2 results ###
@@ -1126,27 +1327,29 @@ deg_DKO <- deg_DKO[deg_DKO$Gene.name!="Sp8",] #remove sp8
 ########## PCA - all samples ###########
 ########################################
 
+### dds_all is built in Deseq2_DKO.R, not here, and still carries the raw
+### sequencing IDs. Load it if absent and map its columns onto the replicate
+### display names, otherwise the group lookup below returns NA and the heatmap
+### columns keep the old labels. Idempotent: names already mapped are left be.
+if (!exists("dds_all")) dds_all <- readRDS("revisions/output/dds_all_DKO.RDS")
+
+old_ids <- colnames(dds_all) %in% names(DKO_SAMPLES)
+colnames(dds_all)[old_ids] <- DKO_SAMPLES[colnames(dds_all)[old_ids]]
+stopifnot(all(colnames(dds_all) %in% rownames(colData)))
+
 vst_all <- vst(dds_all, blind = TRUE)
 vst_assay <- as.data.frame(assay(vst_all))
 
 gene_pca <- prcomp(t(vst_assay), scale. = FALSE)
-pca_df <- as.data.frame(gene_pca$x)
-pca_df$Sample <- rownames(pca_df)
-pca_df$group <- colData[pca_df$Sample, "genotype"]
-pct_var <- setNames(round(100 * gene_pca$sdev^2 / sum(gene_pca$sdev^2), 1), paste0("PC", seq_along(gene_pca$sdev)))
+pca_df   <- pca_scores(gene_pca, colData)
+pct_var  <- pca_pct_var(gene_pca)
 
-plot_pca <- function(df, pcx, pcy, pct_var = NULL) {
-  xlab <- if (!is.null(pct_var)) paste0(pcx, " (", pct_var[pcx], "%)") else pcx
-  ylab <- if (!is.null(pct_var)) paste0(pcy, " (", pct_var[pcy], "%)") else pcy
-  ggplot(df, aes_string(x = pcx, y = pcy, color = "group", label = "Sample")) +
-    geom_point(size = 5) +
-    geom_text_repel(size = 4) +
-    labs(title = paste("PCA:", pcx, "vs", pcy),
-         x = xlab, y = ylab) +
-    theme_minimal()
-}
+plot_pca(pca_df, "PC1", "PC2", pct_var, title = "PCA: WT vs DKO"); ggsave("revisions/Plots/PCA_DKO_PC1vsPC2.png")
 
-plot_pca(pca_df, "PC1", "PC2", pct_var); ggsave("revisions/Plots/PCA_DKO_PC1vsPC2.png")
+add_source_data("Supp PCA DKO",
+  data.frame(pca_df[, c("Sample", "group", "PC1", "PC2")],
+             pct_var_PC1 = pct_var[["PC1"]], pct_var_PC2 = pct_var[["PC2"]]),
+  "Supplementary QC: PCA scores of WT and DKO RNA-seq samples")
 
 
 ########################################
@@ -1164,14 +1367,18 @@ top_pc1 <- top_genes_pc(loadings, 1)
 # Use VST matrix for heatmaps (more appropriate than raw counts)
 vst_mat <- as.data.frame(assay(vst_all))
 
-pdf("heatmaps/top250_vst_PC1_DKO.pdf", height = 30)
-pheatmap(vst_mat[top_pc1, ], scale = "row",
-         clustering_distance_rows = "correlation",
-         show_rownames = TRUE, show_colnames = TRUE,
-         main = "Top 250 genes impacting PC1 - DKO project",
-         cluster_cols = FALSE)
-dev.off()
+top_pc1_mat <- vst_mat[top_pc1, ]
+# label rows with the gene symbol only
+rownames(top_pc1_mat) <- symbol_only(top_pc1_mat)
 
+pca_heatmap(top_pc1_mat, "heatmaps/top250_vst_PC1_DKO.pdf",
+            "Top 250 PC1 genes - WT vs DKO")
+pca_heatmap(top_pc1_mat, "heatmaps/top250_vst_PC1_DKO_colclustered.pdf",
+            "Top 250 PC1 genes - WT vs DKO", cluster_cols = TRUE)
+
+add_source_data("Supp heatmap DKO",
+  data.frame(gene = rownames(top_pc1_mat), top_pc1_mat, check.names = FALSE),
+  "Supplementary QC: VST expression of the top 250 PC1 genes, WT vs DKO samples (heatmap shows row-scaled values)")
 
 
 ##########VOLCANO PLOTS ###############
@@ -1225,10 +1432,16 @@ ggplot(resord_sp8, aes(x = log2FoldChange, y = -log10(padj))) +
   # Theme
   theme_classic(base_size = 16) +
   labs(x = "Log2 Fold Change",
-       y = "-Log10(P-value)",
+       y = "-Log10(adj P-value)",
        title = NULL) +
   theme(legend.position = "none")
 ggsave("Revisions/Plots/volcano_plot_sp8.png",units = "cm",width = 15,height = 15, dpi = 300)
+
+sd_volc <- resord_sp8[!is.na(resord_sp8$padj),
+                      c("Gene.ID", "Gene.name", "log2FoldChange", "padj", "Category")]
+sd_volc$Labelled_in_plot <- sd_volc$Gene.name %in% Genes_sp8
+add_source_data("Figure 2a volcano Sp8", sd_volc,
+  "Fig 2a (Sp8): log2 fold change and adjusted p-value per gene, WT vs Sp8KO ectoderm")
 
 
 
@@ -1277,10 +1490,16 @@ ggplot(resord_sp6, aes(x = log2FoldChange, y = -log10(padj))) +
   # Theme
   theme_classic(base_size = 16) +
   labs(x = "Log2 Fold Change",
-       y = "-Log10(P-value)",
+       y = "-Log10(adj P-value)",
        title = NULL) +
   theme(legend.position = "none")
 ggsave("Revisions/Plots/volcano_plot_sp6.png",dpi=300, unit="cm",width = 15,height = 15)
+
+sd_volc <- resord_sp6[!is.na(resord_sp6$padj),
+                      c("Gene.ID", "Gene.name", "log2FoldChange", "padj", "Category")]
+sd_volc$Labelled_in_plot <- sd_volc$Gene.name %in% Genes_sp6
+add_source_data("Figure 2a volcano Sp6", sd_volc,
+  "Fig 2a (Sp6): log2 fold change and adjusted p-value per gene, WT vs Sp6KO ectoderm")
 
 
 Genes_sp8 <- unique(c("Fgf8", "Rspo2","En1","Msx1","Fzd1",
@@ -1325,10 +1544,16 @@ ggplot(resord_DKO, aes(x = log2FoldChange, y = -log10(padj))) +
   # Theme
   theme_classic(base_size = 16) +
   labs(x = "Log2 Fold Change",
-       y = "-Log10(P-value)",
+       y = "-Log10(adj P-value)",
        title = NULL) +
   theme(legend.position = "none")
 ggsave("Revisions/Plots/volcano_plot_DKO.png",dpi=300, unit="cm",width = 15,height = 15)
+
+sd_volc <- resord_DKO[!is.na(resord_DKO$padj),
+                      c("Gene.ID", "Gene.name", "log2FoldChange", "padj", "Category")]
+sd_volc$Labelled_in_plot <- sd_volc$Gene.name %in% Genes_sp8
+add_source_data("Figure 2a volcano DKO", sd_volc,
+  "Fig 2a (DKO): log2 fold change and adjusted p-value per gene, WT vs Sp6;Sp8 DKO ectoderm")
 
 
 #--------------------------
@@ -1424,6 +1649,10 @@ ggplot(res_spia_sp8, aes(x = tA, y = -log(pG))) +
 
 ggsave("revisions/Plots/spia_sp8.png",units = "cm",width = 15,height = 15, dpi = 300)
 
+add_source_data("Figure 2b SPIA Sp8",
+  res_spia_sp8[, c("Name", "ID", "pSize", "NDE", "tA", "pG", "pGFdr", "status", "custom_label")],
+  "Fig 2b (Sp8): SPIA pathway perturbation (tA) and global p-value (pG) per KEGG pathway, Sp8KO DEGs")
+
 #----------------------------------------------------------------------
 #----------------------- sp6---------------------
 #-------------------------------------------------------------------
@@ -1463,7 +1692,7 @@ res_spia_sp6$status[res_spia_sp6$pG < 0.05 & res_spia_sp6$tA > 0] <- "Inhibited 
 res_spia_sp6$status[res_spia_sp6$pG < 0.05 & res_spia_sp6$tA < 0] <- "Activated in KO"
 fixedColors <- list('status'=c('Activated in KO'="dodgerblue",'Inhibited in KO'="orange2",'NS'="grey"))
 res_spia_sp6$custom_label <- names(pathways_to_check)[match(res_spia_sp6$ID, pathways_to_check)]
-ggplot(res_spia_sp8, aes(x = tA, y = -log(pG))) +
+ggplot(res_spia_sp6, aes(x = tA, y = -log(pG))) +
   geom_point(aes(color = status)) +
   geom_label_repel(data = subset(res_spia_sp6, ID %in% pathways_to_check),
                    aes(label = custom_label,
@@ -1485,6 +1714,10 @@ ggplot(res_spia_sp8, aes(x = tA, y = -log(pG))) +
   theme(legend.position = "bottom")
 
 ggsave("revisions/Plots/spia_sp6.png",units = "cm",width = 15,height = 15, dpi = 300)
+
+add_source_data("Figure 2b SPIA Sp6",
+  res_spia_sp6[, c("Name", "ID", "pSize", "NDE", "tA", "pG", "pGFdr", "status", "custom_label")],
+  "Fig 2b (Sp6): SPIA pathway perturbation (tA) and global p-value (pG) per KEGG pathway, Sp6KO DEGs")
 
 #----------------------------------------------------------------------
 #----------------------- DKO---------------------
@@ -1547,6 +1780,10 @@ ggplot(res_spia_DKO, aes(x = tA, y = -log(pG))) +
   theme(legend.position = "bottom")
 
 ggsave("revisions/Plots/spia_DKO.png",units = "cm",width = 15,height = 15, dpi = 300)
+
+add_source_data("Figure 2b SPIA DKO",
+  res_spia_DKO[, c("Name", "ID", "pSize", "NDE", "tA", "pG", "pGFdr", "status", "custom_label")],
+  "Fig 2b (DKO): SPIA pathway perturbation (tA) and global p-value (pG) per KEGG pathway, DKO DEGs")
 
 ############################### GO TERMS SINGLEKO DEGS ######################
 
@@ -1612,14 +1849,24 @@ combined_plot <- plot_grid(
 
 ggsave("revisions/Plots/aligned_plots_DAVID_degs.pdf", combined_plot, width = 11, height = 3.5)
 
-write.xlsx(sp8_deg,      "revisions/output/Source_data_3_DEGs_and_DAVID.xlsx", sheetName = "Sp8_deg")
-write.xlsx(sp6_deg,      "revisions/output/Source_data_3_DEGs_and_DAVID.xlsx", sheetName = "Sp6_DEGs", append = T)
-write.xlsx(deg_DKO,      "revisions/output/Source_data_3_DEGs_and_DAVID.xlsx", sheetName = "DKO_DEGs", append = T)
-write.xlsx(sp8_david_BP, "revisions/output/Source_data_3_DEGs_and_DAVID.xlsx", sheetName = "Sp8_DAVID", append = T)
-write.xlsx(sp6_david,    "revisions/output/Source_data_3_DEGs_and_DAVID.xlsx", sheetName = "Sp6_DAVID", append = T)
-write.xlsx(res_spia_sp8, "revisions/output/Source_data_3_DEGs_and_DAVID.xlsx", sheetName = "res_spia_sp8", append = T)
-write.xlsx(res_spia_sp6, "revisions/output/Source_data_3_DEGs_and_DAVID.xlsx", sheetName = "res_spia_sp6", append = T)
-write.xlsx(res_spia_DKO, "revisions/output/Source_data_3_DEGs_and_DAVID.xlsx", sheetName = "res_spia_DKO", append = T)
+sd_go <- sp8_david_BP[c(3, 7,10, 13, 18), c("Term", "Count", "Pop.Hits", "PValue", "FDR")]
+sd_go$Gene_ratio <- sd_go$Count / sd_go$Pop.Hits
+add_source_data("Supp GO DEGs Sp8 DAVID", sd_go,
+  "Supplementary: DAVID GO Biological Process terms shown for Sp8KO DEGs (dot plot)")
+
+sd_go <- sp6_david[c(12,17,19,20,23), c("Term", "Count", "Pop.Hits", "PValue", "FDR")]
+sd_go$Gene_ratio <- sd_go$Count / sd_go$Pop.Hits
+add_source_data("Supp GO DEGs Sp6 DAVID", sd_go,
+  "Supplementary: DAVID GO Biological Process terms shown for Sp6KO DEGs (dot plot)")
+
+write.xlsx(sp8_deg,      "revisions/output/Supplementary_Data_3_DEGs_and_DAVID.xlsx", sheetName = "Sp8_deg")
+write.xlsx(sp6_deg,      "revisions/output/Supplementary_Data_3_DEGs_and_DAVID.xlsx", sheetName = "Sp6_DEGs", append = T)
+write.xlsx(deg_DKO,      "revisions/output/Supplementary_Data_3_DEGs_and_DAVID.xlsx", sheetName = "DKO_DEGs", append = T)
+write.xlsx(sp8_david_BP, "revisions/output/Supplementary_Data_3_DEGs_and_DAVID.xlsx", sheetName = "Sp8_DAVID", append = T)
+write.xlsx(sp6_david,    "revisions/output/Supplementary_Data_3_DEGs_and_DAVID.xlsx", sheetName = "Sp6_DAVID", append = T)
+write.xlsx(res_spia_sp8, "revisions/output/Supplementary_Data_3_DEGs_and_DAVID.xlsx", sheetName = "res_spia_sp8", append = T)
+write.xlsx(res_spia_sp6, "revisions/output/Supplementary_Data_3_DEGs_and_DAVID.xlsx", sheetName = "res_spia_sp6", append = T)
+write.xlsx(res_spia_DKO, "revisions/output/Supplementary_Data_3_DEGs_and_DAVID.xlsx", sheetName = "res_spia_DKO", append = T)
 
 ############################### DIRECT TARGETS SP8 SP6 BY THEMSELVES ######################
 
@@ -1712,8 +1959,8 @@ sp8_dtg_bpe_peak_deg$status <- ifelse(sp8_dtg_bpe_peak_deg$log2FoldChange > 0, "
 write.table(sp8_dtg_bpe_peak_deg[,c(3,4,5,2)],"revisions/input/sp8_dtg_for_meme.bed",  quote = F, row.names = F, col.names = F, sep = "\t")
 write.table(sp6_dtg_bpe_peak_deg[,c(3,4,5,2)],"revisions/input/sp6_dtg_for_meme.bed",  quote = F, row.names = F, col.names = F, sep = "\t")
 
-write.xlsx(sp8_dtg_bpe_peak_deg,"revisions/output/Source_data_4_direct_targets_sKO.xlsx", sheetName="Sp8_dir_tar")
-write.xlsx(sp6_dtg_bpe_peak_deg,"revisions/output/Source_data_4_direct_targets_sKO.xlsx", sheetName="Sp6_dir_tar", append=TRUE)
+write.xlsx(sp8_dtg_bpe_peak_deg,"revisions/output/Supplementary_Data_4_direct_targets_sKO.xlsx", sheetName="Sp8_dir_tar")
+write.xlsx(sp6_dtg_bpe_peak_deg,"revisions/output/Supplementary_Data_4_direct_targets_sKO.xlsx", sheetName="Sp6_dir_tar", append=TRUE)
 
 #####peak distribution
 signed_log_distancedtg8 <- sign(sp8_dtg_bpe_peak_deg$dist_tss_kb) * log10(abs(sp8_dtg_bpe_peak_deg$dist_tss_kb) + 1)
@@ -1748,6 +1995,12 @@ ggplot(data.frame(distance = signed_log_distancedtg8), aes(x = distance)) +
          legend.position = "top")
 ggsave("revisions/Plots/density_plots_Sp8_dtg.png",dpi = 300, height = 4, width=5)
 
+sd_dtg <- sp8_dtg_bpe_peak_deg[, c("peak", "chr", "start", "end", "gene_bpe",
+                                   "dist_tss_kb", "category", "status")]
+sd_dtg$signed_log10_distance <- sign(sd_dtg$dist_tss_kb) * log10(abs(sd_dtg$dist_tss_kb) + 1)
+add_source_data("Figure 2c peaks Sp8", sd_dtg,
+  "Fig 2c (Sp8 density): distance to the nearest TSS of Sp8 peaks assigned to Sp8 direct target genes")
+
 signed_log_distancedtg6 <- sign(sp6_dtg_bpe_peak_deg$dist_tss_kb) * log10(abs(sp6_dtg_bpe_peak_deg$dist_tss_kb) + 1)
 sum(sp6_dtg_bpe_peak_deg$category=="Proximal") #5
 sum(sp6_dtg_bpe_peak_deg$category=="Distal") #43
@@ -1779,6 +2032,12 @@ ggplot(data.frame(distance = signed_log_distancedtg6), aes(x = distance)) +
          ,axis.text.x=element_text(angle = -45, vjust = -0.5),
          legend.position = "top")
 ggsave("D:/ChIP/revisions/Plots/density_plots_Sp6_dtg.png",dpi = 300, height = 4, width=5)
+
+sd_dtg <- sp6_dtg_bpe_peak_deg[, c("peak", "chr", "start", "end", "gene_bpe",
+                                   "dist_tss_kb", "category", "status")]
+sd_dtg$signed_log10_distance <- sign(sd_dtg$dist_tss_kb) * log10(abs(sd_dtg$dist_tss_kb) + 1)
+add_source_data("Figure 2c peaks Sp6", sd_dtg,
+  "Fig 2c (Sp6 density): distance to the nearest TSS of Sp6 peaks assigned to Sp6 direct target genes")
 
 
 ############overlap of direct targets ##########
@@ -1815,6 +2074,11 @@ plot(sp6_eulerr, fills = c("#94df84", "#dfd084","olivedrab1"), labels=list(cex =
 plot(sp8_eulerr, fills = c("#e499cd", "#af99e4","mediumorchid1"), labels=list(cex = 0),quantities=list(cex = 0))
 plot(sp6_eulerr, fills = c("#94df84", "#dfd084","olivedrab1"), labels=list(cex = 0),quantities=list(cex = 0))
 dev.off()
+
+add_source_data("Figure 2c venn Sp8", sd_overlap(list_euler_sp8),
+  "Fig 2c (Sp8 Venn): membership of each gene in the Sp8 binding-associated set and the Sp8KO DEG set")
+add_source_data("Figure 2c venn Sp6", sd_overlap(list_euler_sp6),
+  "Fig 2c (Sp6 Venn): membership of each gene in the Sp6 binding-associated set and the Sp6KO DEG set")
 
 
 intersect(intersect(unique(df_combined_sp8$gene),
@@ -1946,7 +2210,7 @@ common_continuous <- ggplot(data.frame(distance = signed_log_distance_com), aes(
   geom_density(fill = "rosybrown1", alpha = 0.5) +
   geom_vline(xintercept = 0, linetype = "dotted", color = "black") +     # TSS
   geom_vline(xintercept = sign(c(-2, 2)) * log10(abs(c(-2, 2)) + 1), linetype = "dashed") +
-  labs(       x = "Distance to TSS (kb)",
+  labs(       x = "Log10 Distance to TSS (kb)",
        y = "Density") +
   annotate("rect", xmin = -log10(2+1), xmax = log10(2+1), ymin = 0, ymax = Inf, 
            fill = "rosybrown", alpha = 0.3) +
@@ -1956,7 +2220,7 @@ common_continuous <- ggplot(data.frame(distance = signed_log_distance_com), aes(
     labels = c("-1000 kb", "-100 kb", "-10 kb", "-2 kb", 
                "TSS", "2 kb", "10 kb", "100 kb", "1000 kb")
   ) +geom_rug(sides = "b", color = "black", alpha = 0.3, linewidth = 0.2) +
-  theme_minimal(base_size = 16)+
+  theme_minimal(base_size = 18)+
   theme( text = element_text(color = "black"),
          axis.text = element_text(color = "black"),
          axis.title = element_text(color = "black"),
@@ -1968,13 +2232,20 @@ common_continuous <- ggplot(data.frame(distance = signed_log_distance_com), aes(
          ,axis.text.x=element_text(angle = -45, vjust = -0.5))
 ggsave("revisions/Plots/continuous_common_2kb.png", common_continuous, dpi = 300, height = 4, width = 5)
 
+add_source_data("Figure 3c Shared peaks",
+  data.frame(chr = commongb_tss$V1, start = commongb_tss$V2, end = commongb_tss$V3,
+             nearest_gene = commongb_tss$V8, distance_to_TSS_kb = commongb_tss$V12,
+             signed_log10_distance = sign(commongb_tss$V12) * log10(abs(commongb_tss$V12) + 1),
+             location = commongb_tss$distance_label),
+  "Fig 3c (Shared): distance to the nearest TSS of each shared Sp8/Sp6 peak, plotted as density")
+
 
 signed_log_distance_s8s <- sign(sp8_enrich_tss$V12) * log10(abs(sp8_enrich_tss$V12) + 1)
 sp8_spe_continuous <- ggplot(data.frame(distance = signed_log_distance_s8s), aes(x = distance)) +
   geom_density(fill = "mediumorchid1", alpha = 0.5) +
   geom_vline(xintercept = 0, linetype = "dotted", color = "black") +     # TSS
   geom_vline(xintercept = sign(c(-2, 2)) * log10(abs(c(-2, 2)) + 1), linetype = "dashed") +
-  labs(       x = "Distance to TSS (kb)",
+  labs(       x = "Log10 Distance to TSS (kb)",
        y = "Density") +
   annotate("rect", xmin = -log10(2+1), xmax = log10(2+1), ymin = 0, ymax = Inf, 
            fill = "mediumorchid", alpha = 0.3) +
@@ -1994,14 +2265,21 @@ sp8_spe_continuous <- ggplot(data.frame(distance = signed_log_distance_s8s), aes
          legend.title = element_text(color = "black"),
          strip.text = element_text(color = "black")
          ,axis.text.x=element_text(angle = -45, vjust = -0.5))
-ggsave("revisions/output/continuous_sp8_spe_2kb.png", sp8_spe_continuous, dpi = 300)
+ggsave("revisions/Plots/continuous_sp8_spe_2kb.png", sp8_spe_continuous, dpi = 300, height = 4, width = 5)
+
+add_source_data("Figure 3c Sp8-specific peaks",
+  data.frame(chr = sp8_enrich_tss$V1, start = sp8_enrich_tss$V2, end = sp8_enrich_tss$V3,
+             nearest_gene = sp8_enrich_tss$V8, distance_to_TSS_kb = sp8_enrich_tss$V12,
+             signed_log10_distance = sign(sp8_enrich_tss$V12) * log10(abs(sp8_enrich_tss$V12) + 1),
+             location = sp8_enrich_tss$distance_label),
+  "Fig 3c (Sp8): distance to the nearest TSS of each Sp8-specific peak, plotted as density")
 
 signed_log_distance_s6s <- sign(sp6_enrich_tss$V12) * log10(abs(sp6_enrich_tss$V12) + 1)
 sp6_spe_continuous <- ggplot(data.frame(distance = signed_log_distance_s6s), aes(x = distance)) +
   geom_density(fill = "olivedrab1", alpha = 0.5) +
   geom_vline(xintercept = 0, linetype = "dotted", color = "black") +     # TSS
   geom_vline(xintercept = sign(c(-2, 2)) * log10(abs(c(-2, 2)) + 1), linetype = "dashed") +
-  labs(       x = "Distance to TSS (kb)",
+  labs(       x = "Log10 Distance to TSS (kb)",
        y = "Density") +
   annotate("rect", xmin = -log10(2+1), xmax = log10(2+1), ymin = 0, ymax = Inf, 
            fill = "olivedrab4", alpha = 0.3) +
@@ -2021,7 +2299,14 @@ sp6_spe_continuous <- ggplot(data.frame(distance = signed_log_distance_s6s), aes
          legend.title = element_text(color = "black"),
          strip.text = element_text(color = "black")
          ,axis.text.x=element_text(angle = -45, vjust = -0.5))
-ggsave("revisions/output/continuous_sp6_spe_2kb.png", sp6_spe_continuous, dpi = 300)
+ggsave("revisions/Plots/continuous_sp6_spe_2kb.png", sp6_spe_continuous, dpi = 300, height = 4, width = 5)
+
+add_source_data("Figure 3c Sp6-specific peaks",
+  data.frame(chr = sp6_enrich_tss$V1, start = sp6_enrich_tss$V2, end = sp6_enrich_tss$V3,
+             nearest_gene = sp6_enrich_tss$V8, distance_to_TSS_kb = sp6_enrich_tss$V12,
+             signed_log10_distance = sign(sp6_enrich_tss$V12) * log10(abs(sp6_enrich_tss$V12) + 1),
+             location = sp6_enrich_tss$distance_label),
+  "Fig 3c (Sp6): distance to the nearest TSS of each Sp6-specific peak, plotted as density")
 
 commongb_tss_ids <- commongb_tss[,c(1,2,3,11,12)]
 sp8_enrich_tss_ids <- sp8_enrich_tss[,c(1,2,3,11,12)]
@@ -2298,6 +2583,11 @@ ggplot(dataall, aes(x = x_label, y = prop, fill = group_clean)) +
 
 ggsave("revisions/Plots/motif_distribution_stacked_plot.png", width = 10, height = 6, dpi = 600)
 
+add_source_data("Supp motif content bars",
+  data.frame(peak_set = dataall$dataset, motif_class = as.character(dataall$group_clean),
+             n_peaks = dataall$value, percentage = dataall$prop),
+  "Supplementary: percentage of Shared / Sp8-specific / Sp6-specific peaks carrying the AT-rich and/or GC-box motifs (FIMO)")
+
 
 #### DIRECT TARGET INFERENCE
 ##INPUT: GENES ASSIGNED TO PEAKS
@@ -2346,6 +2636,9 @@ plot(eul_common_binding, fills = c("lightcoral","mediumorchid1","olivedrab1"), l
 plot(eul_common_binding, fills = c("lightcoral","mediumorchid1","olivedrab1"), labels=list(cex = 0),quantities=list(cex = 0))
 dev.off()
 
+add_source_data("Figure 3d venn", sd_overlap(ls_eul_common_binding),
+  "Fig 3d (Venn): membership of each gene in the shared binding-associated set and the Sp8KO / Sp6KO DEG sets")
+
 commongb_redundant <- df_combined_com %>% 
   filter(!gene %in% commongb_dtg8_tss4$gene ) %>%
   filter(!gene %in% commongb_dtg6_tss4$gene )
@@ -2363,13 +2656,16 @@ plot(eul_redun_binding, fills = c("lightcoral","darkorange"), labels=list(cex = 
 plot(eul_redun_binding, fills = c("lightcoral","darkorange"), labels=list(cex = 0),quantities=list(cex = 0))
 dev.off()
 
+add_source_data("Figure 3f venn", sd_overlap(ls_eul_redund),
+  "Fig 3f (Venn): membership of each gene in the shared binding-associated set not DE in single KOs and the DKO DEG set")
+
 commongb_redundant_degdko <- merge(commongb_redundant,deg_DKO, by.x = "gene", by.y="Gene.name")
 commongb_redundant_degdko$status <- ifelse(commongb_redundant_degdko$log2FoldChange > 0, "Down in KO", "Up in KO")
 
 commongb_redundant_degdko <- commongb_redundant_degdko[,c(2:3,1,43,31,35,37:42,6,16,10:15,19,28,23:27)]
 
-colnames(commongb_redundant_degdko) <- c("peak" ,            "dist" ,            "gene"      ,       "status_dko"        ,   "log2FoldChange_dko"  , "padj_dko"     ,        "TPM_RNA_WT_rep1" ,   "TPM_RNA_WT_rep2"   ,
-                                         "TPM_RNA_WT_rep3",    "TPM_RNA_DKO_rep1"  , "TPM_RNA_DKO_rep2"  , "TPM_RNA_DKO_rep3"  , "log2FoldChange.sp8" ,"Category.sp8"  ,     "padj.sp8"       ,    "TPM_sp8_KO_rep1" ,
+colnames(commongb_redundant_degdko) <- c("peak" ,            "dist" ,            "gene"      ,       "status_dko"        ,   "log2FoldChange_dko"  , "padj_dko"     ,        "TPM_WT_rep1" ,   "TPM_WT_rep2"   ,
+                                         "TPM_WT_rep3",    "TPM_DKO_rep1"  , "TPM_DKO_rep2"  , "TPM_DKO_rep3"  ,"log2FoldChange.sp8" ,"Category.sp8"  ,     "padj.sp8"       ,    "TPM_sp8_KO_rep1" ,
                                           "TPM_sp8_KO_rep2",  "TPM_sp8_WT_rep1",  "TPM_sp8_WT_rep2" , "TPM_sp8_WT_rep3"  ,"log2FoldChange.sp6", "Category.sp6"  ,     "padj.sp6"       ,    "TPM_sp6_KO_rep1" ,
                                           "TPM_sp6_KO_rep2",  "TPM_sp6_WT_rep1",  "TPM_sp6_WT_rep2" )
 
@@ -2412,6 +2708,11 @@ plot(eul_sp8_rich_dtg_tss4, fills = c("mediumpurple","mediumorchid1"), labels=li
 plot(eul_sp8_rich_dtg_tss4, fills = c("mediumpurple","mediumorchid1"), labels=list(cex = 0),quantities=list(cex = 0))
 dev.off()
 
+add_source_data("Figure 3e venn Sp8-specific",
+  sd_overlap(list("sp8_rich_binding_associated_genes" = unique(df_combined_sp8$gene),
+                  "DEG_sp8" = unique(sp8_deg$Gene.name))),
+  "Fig 3e (Venn): membership of each gene in the Sp8-specific binding-associated set and the Sp8KO DEG set")
+
 sp6_rich_dtg_tss4 <- as.data.frame(intersect(sp6_deg$Gene.name, df_combined_sp6$gene))
 sp6_rich_dtg_tss4 <- as.data.frame(merge(df_combined_sp6, sp6_rich_dtg_tss4, by.x="gene", by.y=colnames(sp6_rich_dtg_tss4)[1]))
 sp6_rich_dtg_tss4 <- as.data.frame(merge(sp6_rich_dtg_tss4, sp6_enrich_tss_ids, by="peak"))
@@ -2428,6 +2729,11 @@ pdf("revisions/Plots/eul_sp6_rich_binding.pdf", width = 10, height = 10)
 plot(eul_sp6_rich_dtg_tss4, fills = c("#d5fec2","olivedrab1"), labels=list(cex = 2),quantities=list(cex = 2))
 plot(eul_sp6_rich_dtg_tss4, fills = c("#d5fec2","olivedrab1"), labels=list(cex = 0),quantities=list(cex = 0))
 dev.off()
+
+add_source_data("Supp venn Sp6-specific",
+  sd_overlap(list("sp6_rich_binding_associated_genes" = unique(df_combined_sp6$gene),
+                  "DEG_sp6" = unique(sp6_deg$Gene.name))),
+  "Supplementary: membership of each gene in the Sp6-specific binding-associated set and the Sp6KO DEG set")
 
 
 intersect(sp6_rich_dtg_tss4$gene, commongb_dtg6_tss4$gene)
@@ -2478,7 +2784,7 @@ motif_lookup <- bind_rows(motif_common, motif_sp8, motif_sp6) %>%
   distinct(peak_id, .keep_all = TRUE) %>%
   select(peak_id, motif_content)
 
-# ── Add peak_id column and merge motif info into each source dataframe ────────
+# ── Add peak_id column and merge motif info into each Supplementary Data dataframe ─
 add_motif_to_df <- function(df) {
   # Build peak_id from coordinates — adjust column names if different
   df %>%
@@ -2644,11 +2950,22 @@ combined_plot <- (p2 | p4) / (p1 | p3) / (p5 | p5)
 
 ggsave("revisions/Plots/DAVID_Fig3_aligned_plots.jpg", combined_plot, dpi = 300, width = 10, height = 9.75)
 
-xlsx::write.xlsx(com_david_BP, "output/Source_data_6_Targets_DAVID.xlsx", sheetName = "Shared_Sp8_Sp6_Dependent_DAVID")
-xlsx::write.xlsx(cmr_david_BP, "output/Source_data_6_Targets_DAVID.xlsx", sheetName = "Redundant_DAVID", append = T)
-xlsx::write.xlsx(cm8_david_BP, "output/Source_data_6_Targets_DAVID.xlsx", sheetName = "Shared_Sp8_Dependent_DAVID", append = T)
-xlsx::write.xlsx(cm6_david_BP, "output/Source_data_6_Targets_DAVID.xlsx", sheetName = "Shared_Sp6_Dependent_DAVID", append = T)
-xlsx::write.xlsx(sp8_david_BP, "output/Source_data_6_Targets_DAVID.xlsx", sheetName = "Sp6-specific_DAVID", append = T)
+add_source_data("Figure 3d GO Sp8&Sp6-dep", sd_david_go(com_david_BP[c(1,3,7,6), ]),
+  "Fig 3d: DAVID GO terms shown for shared Sp8&Sp6-dependent target genes")
+add_source_data("Figure 3d GO Sp8-dep", sd_david_go(cm8_david_BP[c(4, 15, 25, 26, 27), ]),
+  "Fig 3d: DAVID GO terms shown for shared Sp8-dependent target genes")
+add_source_data("Figure 3d GO Sp6-dep", sd_david_go(cm6_david_BP[c(3,6,8,12), ]),
+  "Fig 3d: DAVID GO terms shown for shared Sp6-dependent target genes")
+add_source_data("Figure 3e GO Sp8-specific", sd_david_go(sp8_david_BP[c(4, 19, 24, 28, 87), ]),
+  "Fig 3e: DAVID GO terms shown for Sp8-specific target genes")
+add_source_data("Figure 3f GO redundant", sd_david_go(cmr_david[c(12,14,15,17,28), ], pcol = "P.Value"),
+  "Fig 3f: DAVID GO terms shown for redundantly regulated genes (shared binding, DE only in DKO)")
+
+xlsx::write.xlsx(com_david_BP, "revisions/output/Supplementary_Data_6_Targets_DAVID.xlsx", sheetName = "Shared_Sp8_Sp6_Dependent_DAVID")
+xlsx::write.xlsx(cmr_david_BP, "revisions/output/Supplementary_Data_6_Targets_DAVID.xlsx", sheetName = "Redundant_DAVID", append = T)
+xlsx::write.xlsx(cm8_david_BP, "revisions/output/Supplementary_Data_6_Targets_DAVID.xlsx", sheetName = "Shared_Sp8_Dependent_DAVID", append = T)
+xlsx::write.xlsx(cm6_david_BP, "revisions/output/Supplementary_Data_6_Targets_DAVID.xlsx", sheetName = "Shared_Sp6_Dependent_DAVID", append = T)
+xlsx::write.xlsx(sp8_david_BP, "revisions/output/Supplementary_Data_6_Targets_DAVID.xlsx", sheetName = "Sp8-specific_DAVID", append = T)
 
 #################################################
 ###### intersects with prev lists fig s4e #########
@@ -2698,6 +3015,9 @@ ggtexttable(overlap_table, rows = NULL,
             ))
 
 ggsave("revisions/Plots/table_overlaps.jpeg", dpi = 300, width = 5)
+
+add_source_data("Supp DKO overlap table", overlap_table,
+  "Supplementary: overlap of each target gene category with the DKO DEG set (table panel)")
 
 
 ##################################################
@@ -2963,7 +3283,7 @@ scrna_lookup <- master_df %>%
   select(gene, classification) %>%
   distinct(gene, .keep_all = TRUE)
 
-#add this info to source data
+#add this info to supplementary data
 commongb_tss4_common_dtg  <- merge(commongb_tss4_common_dtg  , scrna_lookup, by = "gene")
 commongb_redundant_degdko <- merge(commongb_redundant_degdko , scrna_lookup, by = "gene")
 commongb_dtg8_tss4        <- merge(commongb_dtg8_tss4        , scrna_lookup, by = "gene")
@@ -3039,6 +3359,12 @@ ggplot(pct_table %>%
 
 ggsave("revisions/Plots/classification_pct_barplot.png",
        width = 8, height = 5, dpi = 200)
+
+sd_bar <- as.data.frame(pct_table[pct_table$gene_set %in% names(geneset_labels),
+                                  c("gene_set", "classification", "n", "pct")])
+sd_bar$gene_set_label <- geneset_labels[sd_bar$gene_set]
+add_source_data("Supp scRNA class bars", sd_bar,
+  "Supplementary: scRNA-seq expression classification of each gene set, counts and percentages (stacked bars)")
 
 rm(geneset_config)
 ##################################  limb phenotype annotation
@@ -3204,7 +3530,7 @@ phenotype_lookup <- data.frame(
   ) %>%
   dplyr::select(gene, phenotype_annot)
 
-#ADD ANNOTATION TO SOURCE DATA 5
+#ADD ANNOTATION TO SUPPLEMENTARY DATA 5
 commongb_tss4_common_dtg  <- merge(commongb_tss4_common_dtg  , phenotype_lookup, by = "gene")
 commongb_redundant_degdko <- merge(commongb_redundant_degdko , phenotype_lookup, by = "gene")
 commongb_dtg8_tss4        <- merge(commongb_dtg8_tss4        , phenotype_lookup, by = "gene")
@@ -3213,15 +3539,15 @@ sp8_rich_dtg_tss4         <- merge(sp8_rich_dtg_tss4         , phenotype_lookup,
 sp6_rich_dtg_tss4         <- merge(sp6_rich_dtg_tss4         , phenotype_lookup, by = "gene")
 
 #rewrite
-xlsx::write.xlsx(commongb_tss, "revisions/output/Source_data_5_Overlap_analysis.xlsx", sheetName = "Shared_peaks", row.names = F)
-xlsx::write.xlsx(sp8_enrich_tss, "revisions/output/Source_data_5_Overlap_analysis.xlsx", sheetName = "Sp8_specific_peaks", append = T, row.names = F)
-xlsx::write.xlsx(sp6_enrich_tss, "revisions/output/Source_data_5_Overlap_analysis.xlsx", sheetName = "Sp6_specific_peaks", append = T, row.names = F)
-xlsx::write.xlsx(commongb_tss4_common_dtg, "revisions/output/Source_data_5_Overlap_analysis.xlsx", sheetName = "Shared_Sp8_Sp6_Dependent.xlsx",append = T, row.names = F)
-xlsx::write.xlsx(commongb_redundant_degdko, "revisions/output/Source_data_5_Overlap_analysis.xlsx", sheetName = "Shared_redundant.xlsx",append = T, row.names = F)
-xlsx::write.xlsx(commongb_dtg8_tss4, "revisions/output/Source_data_5_Overlap_analysis.xlsx", sheetName = "Shared_Sp8_Dependent.xlsx",append = T, row.names = F)
-xlsx::write.xlsx(commongb_dtg6_tss4, "revisions/output/Source_data_5_Overlap_analysis.xlsx", sheetName = "Shared_Sp6_Dependent.xlsx",append = T, row.names = F)
-xlsx::write.xlsx(sp8_rich_dtg_tss4, "revisions/output/Source_data_5_Overlap_analysis.xlsx", sheetName = "Sp8_specific.xlsx",append = T,row.names = F)
-xlsx::write.xlsx(sp6_rich_dtg_tss4, "revisions/output/Source_data_5_Overlap_analysis.xlsx", sheetName = "Sp6_specific.xlsx",append = T,row.names = F)
+xlsx::write.xlsx(commongb_tss, "revisions/output/Supplementary_Data_5_Overlap_analysis.xlsx", sheetName = "Shared_peaks", row.names = F)
+xlsx::write.xlsx(sp8_enrich_tss, "revisions/output/Supplementary_Data_5_Overlap_analysis.xlsx", sheetName = "Sp8_specific_peaks", append = T, row.names = F)
+xlsx::write.xlsx(sp6_enrich_tss, "revisions/output/Supplementary_Data_5_Overlap_analysis.xlsx", sheetName = "Sp6_specific_peaks", append = T, row.names = F)
+xlsx::write.xlsx(commongb_tss4_common_dtg, "revisions/output/Supplementary_Data_5_Overlap_analysis.xlsx", sheetName = "Shared_Sp8_Sp6_Dependent",append = T, row.names = F)
+xlsx::write.xlsx(commongb_redundant_degdko, "revisions/output/Supplementary_Data_5_Overlap_analysis.xlsx", sheetName = "Shared_redundant",append = T, row.names = F)
+xlsx::write.xlsx(commongb_dtg8_tss4, "revisions/output/Supplementary_Data_5_Overlap_analysis.xlsx", sheetName = "Shared_Sp8_Dependent",append = T, row.names = F)
+xlsx::write.xlsx(commongb_dtg6_tss4, "revisions/output/Supplementary_Data_5_Overlap_analysis.xlsx", sheetName = "Shared_Sp6_Dependent",append = T, row.names = F)
+xlsx::write.xlsx(sp8_rich_dtg_tss4, "revisions/output/Supplementary_Data_5_Overlap_analysis.xlsx", sheetName = "Sp8_specific",append = T,row.names = F)
+xlsx::write.xlsx(sp6_rich_dtg_tss4, "revisions/output/Supplementary_Data_5_Overlap_analysis.xlsx", sheetName = "Sp6_specific",append = T,row.names = F)
 
 
 ############################ ############################ ############################ ############################ 
@@ -3348,6 +3674,12 @@ ggplot(phen_long, aes(x = gs_label, y = pct, fill = phenotype)) +
 ggsave("revisions/Plots/phenotype_pct_barplot.png",
        width = 8, height = 5, dpi = 600)
 
+add_source_data("Supp phenotype bars",
+  data.frame(gene_set = phen_long$gene_set, gene_set_label = as.character(phen_long$gs_label),
+             phenotype = as.character(phen_long$phenotype), n = phen_long$n,
+             n_total = phen_long$n_total, percentage = phen_long$pct),
+  "Supplementary: limb/ectodermal phenotype annotation of each gene set, counts and percentages (stacked bars)")
+
 ############################ ############################ ############################ ############################ 
 ############################  annotated pathways heatmaps ###################################
 ############################ ############################ ############################ ############################ 
@@ -3386,23 +3718,49 @@ for (i in seq_along(pathways_to_check)) {
 }
 
 # ── 2. PREP DEG TABLES ───────────────────────────────────────────────────────
-resord_sp8 <- resord_sp8 %>%
-  arrange(padj) %>%
-  filter(!duplicated(Gene.name)) %>%
-  as.data.frame()
+# One row per gene symbol, most significant first. Rows whose Gene.name is NA
+# (Ensembl IDs with no symbol - separate() leaves NA when the row name carries
+# no "|") MUST be dropped here: a single NA makes `rownames<-` fail with
+# "missing values in 'row.names' are not allowed", the row names silently stay
+# 1..N, and every later lookup by gene symbol returns NA - which is what filled
+# the heatmaps and their Source Data sheets with 0 / "Not_tested".
+one_row_per_gene <- function(res) {
+  res %>%
+    filter(!is.na(Gene.name) & Gene.name != "") %>%
+    arrange(padj) %>%
+    filter(!duplicated(Gene.name)) %>%
+    as.data.frame()
+}
+
+resord_sp8 <- one_row_per_gene(resord_sp8)
 rownames(resord_sp8) <- resord_sp8$Gene.name
 
-resord_sp6 <- resord_sp6 %>%
-  arrange(padj) %>%
-  filter(!duplicated(Gene.name)) %>%
-  as.data.frame()
+resord_sp6 <- one_row_per_gene(resord_sp6)
 rownames(resord_sp6) <- resord_sp6$Gene.name
 
-resord_DKO <- resord_DKO %>%
-  arrange(padj) %>%
-  filter(!duplicated(Gene.name)) %>%
-  as.data.frame()
+resord_DKO <- one_row_per_gene(resord_DKO)
 rownames(resord_DKO) <- resord_DKO$Gene.name
+
+# Look up DESeq2 results by gene SYMBOL rather than by row name. Row names are
+# dropped by any dplyr verb and lost entirely if the assignment above ever
+# fails, so the heatmaps below (and the Source Data sheets built from them)
+# match on the Gene.name column instead.
+res_lookup <- function(res, genes, col = "log2FoldChange") res[[col]][match(genes, res$Gene.name)]
+
+# Vectorised version of the per-gene status used by the heatmap annotations.
+# Same convention as before: positive log2FoldChange = "Down in KO".
+deg_status_by_gene <- function(res, genes,
+                               lfc_thr = lfc_threshold, p_thr = padj_threshold) {
+  i   <- match(genes, res$Gene.name)
+  lfc <- res$log2FoldChange[i]
+  p   <- res$padj[i]
+  out <- rep("NS", length(genes))                      # tested, not significant
+  out[!is.na(p) & p < p_thr & lfc >  lfc_thr] <- "Down in KO"
+  out[!is.na(p) & p < p_thr & lfc < -lfc_thr] <- "Up in KO"
+  out[is.na(i)] <- "Not_tested"                        # absent from the table
+  names(out) <- genes
+  out
+}
 
 
 deg_sp8_genes <- resord_sp8$Gene.name[resord_sp8$padj < padj_threshold &
@@ -3417,8 +3775,8 @@ deg_DKO_genes <- resord_DKO$Gene.name[resord_DKO$padj < padj_threshold &
 any_deg_genes <- union(deg_sp8_genes, union(deg_sp6_genes, deg_DKO_genes))
 
 # ── 3. UPDATE GS WITH notbound_DEGs ──────────────────────────────────────────
-# ── Define the six source dataframes and their names ─────────────────────────
-source_data_list <- list(
+# ── Define the six Supplementary Data dataframes and their names ─────────────
+supp_data_list <- list(
   "Common"        = commongb_tss4_common_dtg,
   "Redundant_DEG" = commongb_redundant_degdko,
   "Common_Sp8"    = commongb_dtg8_tss4,
@@ -3435,7 +3793,7 @@ gs_priority <- c("notbound_DEGs",  "spe6_dtg6", "spe8_dtg8",
                  "redun","Common_sp6", "Common_sp8", "Common")
 
 # ── 4. COLORS ────────────────────────────────────────────────────────────────
-col_lfc <- colorRamp2(c(-3, 0, 3), c("tomato", "white", "steelblue"))
+col_lfc <- circlize::colorRamp2(c(-3, 0, 3), c("tomato", "white", "steelblue"))
 
 gs_colors <- list(
   Common        = c("0" = "white", "1" = "black"),
@@ -3546,12 +3904,12 @@ for (path_name in names(kegg_gene_list)) {
   
   # ── Motif annotation ──────────────────────────────────────────────────────
   # motif_per_gene <- sapply(gene_rows$gene, function(g) {
-  #   df <- rbind(source_data_list[[1]][,c(1,6)],
-  #               source_data_list[[2]][,c(1,6)],
-  #               source_data_list[[3]][,c(1,6)],
-  #               source_data_list[[4]][,c(1,6)],
-  #               source_data_list[[5]][,c(1,6)],
-  #               source_data_list[[6]][,c(1,6)])
+  #   df <- rbind(supp_data_list[[1]][,c(1,6)],
+  #               supp_data_list[[2]][,c(1,6)],
+  #               supp_data_list[[3]][,c(1,6)],
+  #               supp_data_list[[4]][,c(1,6)],
+  #               supp_data_list[[5]][,c(1,6)],
+  #               supp_data_list[[6]][,c(1,6)])
   #   peaks_for_gene <- df$peak[df$gene == g]
   #   motifs <- motif_lookup$motif_content[motif_lookup$peak_id %in% peaks_for_gene]
   #   if (length(motifs) == 0) return("No_motif")
@@ -3566,45 +3924,22 @@ for (path_name in names(kegg_gene_list)) {
   )
   
   # ── 5b. LFC MATRIX ────────────────────────────────────────────────────────
-  lfc_sp8 <- resord_sp8[gene_rows$gene, "log2FoldChange"]
-  lfc_sp6 <- resord_sp6[gene_rows$gene, "log2FoldChange"]
-  lfc_DKO <- resord_DKO[gene_rows$gene, "log2FoldChange"]
-  
+  lfc_sp8 <- res_lookup(resord_sp8, gene_rows$gene)
+  lfc_sp6 <- res_lookup(resord_sp6, gene_rows$gene)
+  lfc_DKO <- res_lookup(resord_DKO, gene_rows$gene)
+
   lfc_matrix <- data.frame(
     WTvsSp8KO = ifelse(is.na(lfc_sp8), 0, lfc_sp8),
     WTvsSp6KO = ifelse(is.na(lfc_sp6), 0, lfc_sp6),
     WTvsDKO   = ifelse(is.na(lfc_DKO), 0, lfc_DKO),
     row.names = gene_rows$row_label
   )
-  
+
   # ── 5c. ANNOTATIONS ───────────────────────────────────────────────────────
-  deg_sp8_status <- sapply(gene_rows$gene, function(g) {
-    if (!g %in% rownames(resord_sp8)) return("Not_tested")
-    r <- resord_sp8[g, ]
-    if (is.na(r$padj)) return("NS")
-    if (r$padj < padj_threshold & r$log2FoldChange >  lfc_threshold) return("Down in KO")
-    if (r$padj < padj_threshold & r$log2FoldChange < -lfc_threshold) return("Up in KO")
-    return("NS")
-  })
-  
-  deg_sp6_status <- sapply(gene_rows$gene, function(g) {
-    if (!g %in% rownames(resord_sp6)) return("Not_tested")
-    r <- resord_sp6[g, ]
-    if (is.na(r$padj)) return("NS")
-    if (r$padj < padj_threshold & r$log2FoldChange >  lfc_threshold) return("Down in KO")
-    if (r$padj < padj_threshold & r$log2FoldChange < -lfc_threshold) return("Up in KO")
-    return("NS")
-  })
-  
-  deg_dko_status <- sapply(gene_rows$gene, function(g) {
-    if (!g %in% rownames(resord_DKO)) return("Not_tested")
-    r <- resord_DKO[g, ]
-    if (is.na(r$padj)) return("NS")
-    if (r$padj < padj_threshold & r$log2FoldChange >  lfc_threshold) return("Down in KO")
-    if (r$padj < padj_threshold & r$log2FoldChange < -lfc_threshold) return("Up in KO")
-    return("NS")
-  })
-  
+  deg_sp8_status <- deg_status_by_gene(resord_sp8, gene_rows$gene)
+  deg_sp6_status <- deg_status_by_gene(resord_sp6, gene_rows$gene)
+  deg_dko_status <- deg_status_by_gene(resord_DKO, gene_rows$gene)
+
   limb_annot <- ifelse(gene_rows$gene %in% limb_mouse_genes, "Limb", "")
   ecto_annot <- ifelse(gene_rows$gene %in% limb_ect_genes,   "Ectodermal", "")
   phenotype_annot <- case_when(
@@ -3678,18 +4013,33 @@ for (path_name in names(kegg_gene_list)) {
   draw(ht, merge_legend = TRUE)
   dev.off()
   message("Saved: ", out_file)
+
+  # WTvs* = the value the heatmap cell shows (0 where the gene is absent from
+  # that DESeq2 table); padj_* are the underlying statistics, NA when untested.
+  add_source_data(substr(paste0("Supp KEGG ", safe_name), 1, 31),
+    data.frame(gene = gene_rows$gene, row_label = gene_rows$row_label,
+               gene_set = as.character(gene_rows$gs_group),
+               lfc_matrix,
+               padj_Sp8 = res_lookup(resord_sp8, gene_rows$gene, "padj"),
+               padj_Sp6 = res_lookup(resord_sp6, gene_rows$gene, "padj"),
+               padj_DKO = res_lookup(resord_DKO, gene_rows$gene, "padj"),
+               DEG_Sp8 = deg_sp8_status, DEG_Sp6 = deg_sp6_status,
+               DEG_DKO = deg_dko_status, Phenotype = phenotype_annot,
+               check.names = FALSE),
+    paste0("Supplementary KEGG heatmap (", path_name,
+           "): log2FC in Sp8KO / Sp6KO / DKO and annotations per pathway gene"))
 }
 
 # ############################################### ANNOTATE genes in all CATEGORIES ################
 # 
 # 
 # # ── Loop ─────────────────────────────────────────────────────────────────────
-# for (df_name in names(source_data_list)) {
+# for (df_name in names(supp_data_list)) {
 #   
 #   message("\n===== Heatmap for: ", df_name, " =====")
 #   
 #   # Get genes from the dataframe
-#   genes_in_set <- unique(source_data_list[[df_name]]$gene)
+#   genes_in_set <- unique(supp_data_list[[df_name]]$gene)
 #   genes_in_set <- genes_in_set[!is.na(genes_in_set)]
 #   
 #   if (length(genes_in_set) < 2) {
@@ -3719,12 +4069,12 @@ for (path_name in names(kegg_gene_list)) {
 #   motif_per_gene <- sapply(gene_rows$gene, function(g) {
 #     # Get all peaks associated with this gene in the current source df
 #     
-#     df <- rbind(source_data_list[[1]][,c(1,6)],
-#                 source_data_list[[2]][,c(1,3)],
-#                 source_data_list[[3]][,c(1,6)],
-#                 source_data_list[[4]][,c(1,6)],
-#                 source_data_list[[5]][,c(1,6)],
-#                 source_data_list[[6]][,c(1,6)])
+#     df <- rbind(supp_data_list[[1]][,c(1,6)],
+#                 supp_data_list[[2]][,c(1,3)],
+#                 supp_data_list[[3]][,c(1,6)],
+#                 supp_data_list[[4]][,c(1,6)],
+#                 supp_data_list[[5]][,c(1,6)],
+#                 supp_data_list[[6]][,c(1,6)])
 #     peaks_for_gene <- df$peak[df$gene == g]
 #     motifs <- motif_lookup$motif_content[motif_lookup$peak_id %in% peaks_for_gene]
 #     if (length(motifs) == 0) return("No_motif")
@@ -3880,7 +4230,7 @@ gene_rows$row_label <- ifelse(
 )
 
 motif_per_gene <- sapply(gene_rows$gene, function(g) {
-  for (sdf in source_data_list) {
+  for (sdf in supp_data_list) {
     if (!"motif_content" %in% colnames(sdf) || !"gene" %in% colnames(sdf)) next
     motifs <- sdf$motif_content[sdf$gene == g]
     motifs <- motifs[!is.na(motifs) & motifs != "No_motif"]
@@ -3891,9 +4241,9 @@ motif_per_gene <- sapply(gene_rows$gene, function(g) {
 })
 
 # LFC matrix
-lfc_sp8 <- resord_sp8[gene_rows$gene, "log2FoldChange"]
-lfc_sp6 <- resord_sp6[gene_rows$gene, "log2FoldChange"]
-lfc_DKO <- resord_DKO[gene_rows$gene, "log2FoldChange"]
+lfc_sp8 <- res_lookup(resord_sp8, gene_rows$gene)
+lfc_sp6 <- res_lookup(resord_sp6, gene_rows$gene)
+lfc_DKO <- res_lookup(resord_DKO, gene_rows$gene)
 
 lfc_matrix <- data.frame(
   WTvsSp8KO = ifelse(is.na(lfc_sp8), 0, lfc_sp8),
@@ -3903,32 +4253,9 @@ lfc_matrix <- data.frame(
 )
 
 # Annotations
-deg_sp8_status <- sapply(gene_rows$gene, function(g) {
-  if (!g %in% rownames(resord_sp8)) return("Not_tested")
-  r <- resord_sp8[g, ]
-  if (is.na(r$padj)) return("NS")
-  if (r$padj < padj_threshold & r$log2FoldChange >  lfc_threshold) return("Down in KO")
-  if (r$padj < padj_threshold & r$log2FoldChange < -lfc_threshold) return("Up in KO")
-  return("NS")
-})
-
-deg_sp6_status <- sapply(gene_rows$gene, function(g) {
-  if (!g %in% rownames(resord_sp6)) return("Not_tested")
-  r <- resord_sp6[g, ]
-  if (is.na(r$padj)) return("NS")
-  if (r$padj < padj_threshold & r$log2FoldChange >  lfc_threshold) return("Down in KO")
-  if (r$padj < padj_threshold & r$log2FoldChange < -lfc_threshold) return("Up in KO")
-  return("NS")
-})
-
-deg_dko_status <- sapply(gene_rows$gene, function(g) {
-  if (!g %in% rownames(resord_DKO)) return("Not_tested")
-  r <- resord_DKO[g, ]
-  if (is.na(r$padj)) return("NS")
-  if (r$padj < padj_threshold & r$log2FoldChange >  lfc_threshold) return("Down in KO")
-  if (r$padj < padj_threshold & r$log2FoldChange < -lfc_threshold) return("Up in KO")
-  return("NS")
-})
+deg_sp8_status <- deg_status_by_gene(resord_sp8, gene_rows$gene)
+deg_sp6_status <- deg_status_by_gene(resord_sp6, gene_rows$gene)
+deg_dko_status <- deg_status_by_gene(resord_DKO, gene_rows$gene)
 deg_sp6_status[gene_rows$gene == "Sp6"] <- "Excluded_self"
 deg_dko_status[gene_rows$gene == "Sp6"] <- "Excluded_self"
 
@@ -4011,6 +4338,8 @@ ht_custom <- Heatmap(
 num_rows    <- nrow(lfc_matrix)
 calc_height <- (num_rows * ROW_HEIGHT_MM) / 25.4 + 3.5
 
+
+
 pdf("revisions/Plots/custom_genes_heatmap.pdf",
     width  = 12,
     height = max(8, calc_height + 1))
@@ -4018,8 +4347,22 @@ draw(ht_custom, merge_legend = TRUE)
 dev.off()
 message("Saved: revisions/Plots/custom_genes_heatmap.pdf")
 
+# WTvs* = the value the heatmap cell shows (0 where the gene is absent from
+# that DESeq2 table); padj_* are the underlying statistics, NA when untested.
+add_source_data("Supp custom genes heatmap",
+  data.frame(gene = gene_rows$gene, row_label = gene_rows$row_label,
+             gene_set = geneset_labels[as.character(gene_rows$gs_group)],
+             lfc_matrix,
+             padj_Sp8 = res_lookup(resord_sp8, gene_rows$gene, "padj"),
+             padj_Sp6 = res_lookup(resord_sp6, gene_rows$gene, "padj"),
+             padj_DKO = res_lookup(resord_DKO, gene_rows$gene, "padj"),
+             DEG_Sp8 = deg_sp8_status, DEG_Sp6 = deg_sp6_status, DEG_DKO = deg_dko_status,
+             scRNA_class = scrna_class, Phenotype = phenotype_annot, Motif = motif_per_gene,
+             check.names = FALSE),
+  "Supplementary: log2FC in Sp8KO / Sp6KO / DKO and annotations for the curated in situ validated gene panel (heatmap)")
+
 ################################################################################
-#################### Source Data 7 — KEGG pathway heatmap data ################
+################# Supplementary Data 7 — KEGG pathway heatmap data ############
 ################################################################################
 
 # ── Helper: classify DEG status ──────────────────────────────────────────────
@@ -4033,7 +4376,7 @@ deg_status <- function(lfc, pval,
   )
 }
 
-# ── Normalise each source df to a common schema ───────────────────────────────
+# ── Normalise each Supplementary Data df to a common schema ───────────────────
 # Common / Common_Sp8 / Specific_Sp8/Sp6 already have standardised names;
 # commongb_redundant_degdko uses its own naming and already has DKO info.
 
@@ -4088,8 +4431,8 @@ dko_deg_info <- resord_DKO %>%
   mutate(status_DKO = deg_status(L2FC_DKO, padj_DKO))
 
 all_source_combined <- bind_rows(
-  lapply(names(source_data_list), function(nm)
-    norm_source(source_data_list[[nm]], nm))
+  lapply(names(supp_data_list), function(nm)
+    norm_source(supp_data_list[[nm]], nm))
 ) %>%
   # Fill missing Sp8 DEG columns (sp6_rich has none)
   left_join(sp8_deg_info %>% dplyr::select(gene, L2FC_Sp8, status_Sp8, padj_Sp8),
@@ -4131,7 +4474,7 @@ preferred_cols <- c(
 )
 
 # ── One sheet per KEGG pathway ────────────────────────────────────────────────
-out_file_sd7 <- "revisions/output/Source_Data_7_KEGG_heatmaps.xlsx"
+out_file_sd7 <- "revisions/output/Supplementary_Data_7_KEGG_heatmaps.xlsx"
 first_sheet  <- TRUE
 
 for (path_name in names(kegg_gene_list)) {
@@ -4151,7 +4494,7 @@ for (path_name in names(kegg_gene_list)) {
   bound_genes    <- unique(gene_gs$gene[gene_gs$gs_group != "notbound_DEGs"])
   notbound_genes <- unique(gene_gs$gene[gene_gs$gs_group == "notbound_DEGs"])
 
-  # Bound genes: full source data rows
+  # Bound genes: full supplementary data rows
   sheet_bound <- all_source_combined %>%
     filter(gene %in% bound_genes) %>%
     left_join(
@@ -4349,4 +4692,58 @@ annotated_hits_updated <- processed_hits %>%
   relocate(final_genes, .after = source) %>%
   relocate(category,    .after = source)
 
-writexl::write_xlsx(annotated_hits_updated, "revisions/output/Source_Data_8_VISTA_hits.xlsx")
+writexl::write_xlsx(annotated_hits_updated, "revisions/output/Supplementary_Data_8_VISTA_hits.xlsx")
+
+################################################################################
+################## write the Source Data workbook (ncomms) #####################
+################################################################################
+# Writes revisions/output/Source_Data.xlsx with every sheet collected by
+# add_source_data() above (Index sheet first, Figure panels, then
+# supplementary panels - rename the 'Supp ...' sheets to the final
+# supplementary figure/panel numbers before submission).
+#
+# Sheets that cannot be produced from this script and must be added to the
+# workbook by hand before submission:
+#  - RNAscope quantifications: Wnt7a (fluorescence/length, fluorescence/DAPI)
+#    and Fgf8 (fluorescence/AER area, fluorescence/DAPI) bar graphs -
+#    per-section/per-embryo values from the image quantification
+#  - GC-luc luciferase reporter assay (Renilla-subtracted values per replicate)
+#  - uncropped EMSA / BiFC / co-IP scans (go in the 'unprocessed images' part
+#    of the Source Data / supplementary material)
+#  - deepTools binding heatmaps and MEME/STREME motif logos (regenerable from
+#    the GEO-deposited data; not R-plotted here)
+
+write_source_data()
+
+################################################################################
+######################## record the R environment ##############################
+################################################################################
+# Captured in the SAME run that writes the figures and the Source Data, so the
+# record matches the outputs rather than whatever happens to be installed later.
+# Commit revisions/output/sessionInfo.txt alongside the code for the Code
+# Availability statement. Note this covers R packages ONLY - the command-line
+# and web tools (fastp, BWA, SAMtools, sambamba, MACS2, IDR, bedtools,
+# deepTools, MEME-ChIP, seqMINER, Cell Ranger, GREAT, DAVID) are recorded
+# separately in TOOL_VERSIONS.md.
+
+write_session_info <- function(path = "revisions/output/sessionInfo.txt") {
+  # sessioninfo::session_info() also reports each package's source
+  # (CRAN / Bioconductor / GitHub), which base sessionInfo() omits.
+  info <- if (requireNamespace("sessioninfo", quietly = TRUE)) {
+    utils::capture.output(sessioninfo::session_info())
+  } else {
+    c(utils::capture.output(utils::sessionInfo()), "",
+      "# sessioninfo not installed - package sources were not recorded.",
+      "# install.packages('sessioninfo') and re-run for a fuller record.")
+  }
+  bioc <- if (requireNamespace("BiocManager", quietly = TRUE)) {
+    paste0("# Bioconductor version: ", as.character(BiocManager::version()))
+  } else NULL
+
+  writeLines(c(paste0("# Generated:  ", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")),
+               "# Script:     figures_and_source_data.R",
+               bioc, "", info), path)
+  message("Session info written: ", path)
+}
+
+write_session_info()
